@@ -514,7 +514,7 @@ function getSkillInfo(monster) {
  * @returns {number} 倍率の乗算値（1 = 倍率なし）
  */
 function calcDpsMultiplier(monster) {
-  const active = getActiveAwakens(monster);
+  const active = getEffectiveAwakensForSearch(monster);
   let multiplier = 1;
   for (const a of active) {
     if (selectedDpsAwakens.has(a) && awakenMultipliers[a] && awakenMultipliers[a] > 1) {
@@ -4220,7 +4220,7 @@ function checkOptimizeConstraints(newPicks, baseline) {
   for (let i = 0; i < 6; i++) {
     const m = newPicks[i];
     if (!m) continue;
-    const active = getActiveAwakens(m);
+    const active = getEffectiveAwakensForSearch(m);
     active.forEach(a => { newAwakenCounts[a] = (newAwakenCounts[a] || 0) + 1; });
     newTotalSB += getMonsterSB(m);
     if (slotConditions[i].skillUsable) {
@@ -4270,7 +4270,7 @@ function calcOptimizeScore(newPicks, baseline, strategy) {
     for (let i = 0; i < 6; i++) {
       const m = newPicks[i];
       if (!m) continue;
-      getActiveAwakens(m).forEach(a => { newAwakenCounts[a] = (newAwakenCounts[a] || 0) + 1; });
+      getEffectiveAwakensForSearch(m).forEach(a => { newAwakenCounts[a] = (newAwakenCounts[a] || 0) + 1; });
     }
 
     for (const aid of strat.targetAwakens) {
@@ -4401,14 +4401,14 @@ async function runOptimizeSearch(strategy) {
 
     // UI応答性のため定期的にyield
     if (i % 2 === 0) {
-      if (progressStatus) progressStatus.textContent = `最適化検索中... スロット${i + 1}/6`;
+      if (progressStatus) progressStatus.textContent = `最適化検索中... スロット${i + 1}/6 (${improvements.length}件該当あり)`;
       await new Promise(r => setTimeout(r, 0));
       if (optimizeStopRequested) break;
     }
   }
 
   // 2体入替パターン（全数探索 + 非同期yield）
-  if (progressStatus) progressStatus.textContent = '最適化検索中... 2体入替パターン探索中';
+  if (progressStatus) progressStatus.textContent = `最適化検索中... 2体入替パターン探索中 (${improvements.length}件該当あり)`;
   await new Promise(r => setTimeout(r, 0));
 
   let checkCount = 0;
@@ -4447,7 +4447,7 @@ async function runOptimizeSearch(strategy) {
           checkCount++;
           // 非同期yield: 5000回ごとにUIに制御を返す
           if (checkCount % 5000 === 0) {
-            if (progressStatus) progressStatus.textContent = `最適化検索中... ${checkCount.toLocaleString()}件チェック済`;
+            if (progressStatus) progressStatus.textContent = `最適化検索中... ${checkCount.toLocaleString()}件チェック済 (${improvements.length}件該当あり)`;
             await new Promise(r => setTimeout(r, 0));
           }
 
@@ -4524,8 +4524,18 @@ function displayOptimizeResults(results, baseline, strategy) {
       const before = result.before[k];
       const after = result.after[k];
       const baseMon = baseMonsters[slotIdx];
-      const beforeAwakens = getActiveAwakens(before);
-      const afterAwakens = getActiveAwakens(after);
+      const getAwakensHtml = (m) => {
+        if (!m) return '';
+        const allAw = getAllAwakens(m);
+        if (isVanishingAssist(m) && getVanishGrantedAwakens(m)) {
+          const granted = getVanishGrantedAwakens(m);
+          return `<div class="vanish-original">${allAw.map(a => `<img src="${awakenIcon(a)}" title="${awakenName(a)}">`).join('')}</div><span class="vanish-plus" style="margin:0 2px;">＋</span><div class="vanish-granted">${granted.map(a => `<img src="${awakenIcon(a)}" title="${awakenName(a)}">`).join('')}</div>`;
+        }
+        return allAw.map(a => `<img src="${awakenIcon(a)}" title="${awakenName(a)}" class="${hasAwakenAssist(m) ? '' : 'disabled-awaken'}">`).join('');
+      };
+
+      const beforeAwakensHtml = getAwakensHtml(before);
+      const afterAwakensHtml = getAwakensHtml(after);
       const beforeSkill = getSkillInfo(before);
       const afterSkill = getSkillInfo(after);
       const beforeMult = calcDpsMultiplier(before);
@@ -4539,7 +4549,7 @@ function displayOptimizeResults(results, baseline, strategy) {
             <div class="optimize-before">
               <div class="optimize-compare-label">BEFORE</div>
               <div class="optimize-mon-name" style="display:flex; align-items:center; gap:4px; justify-content:center;">${getMonsterIconHtml(before.no)} No.${before.no} ${before.name}</div>
-              <div class="optimize-awakens">${beforeAwakens.map(a => `<img src="${awakenIcon(a)}" title="${awakenName(a)}">`).join('')}</div>
+              <div class="optimize-awakens">${beforeAwakensHtml}</div>
               ${beforeSkill ? `<div class="optimize-skill">${beforeSkill.name} (${beforeSkill.baseTurn}→${beforeSkill.minTurn})</div>` : ''}
               ${beforeMult > 1 ? `<div class="optimize-mult">倍率: x${beforeMult.toFixed(1)}</div>` : ''}
             </div>
@@ -4547,7 +4557,7 @@ function displayOptimizeResults(results, baseline, strategy) {
             <div class="optimize-after">
               <div class="optimize-compare-label">AFTER</div>
               <div class="optimize-mon-name" style="display:flex; align-items:center; gap:4px; justify-content:center;">${getMonsterIconHtml(after.no)} No.${after.no} ${after.name}</div>
-              <div class="optimize-awakens">${afterAwakens.map(a => `<img src="${awakenIcon(a)}" title="${awakenName(a)}">`).join('')}</div>
+              <div class="optimize-awakens">${afterAwakensHtml}</div>
               ${afterSkill ? `<div class="optimize-skill">${afterSkill.name} (${afterSkill.baseTurn}→${afterSkill.minTurn})</div>` : ''}
               ${afterMult > 1 ? `<div class="optimize-mult ${multDiff > 0 ? 'improved' : ''}">倍率: x${afterMult.toFixed(1)}${multDiff > 0 ? ` (+${multDiff.toFixed(1)})` : ''}</div>` : ''}
             </div>
@@ -4608,7 +4618,7 @@ function displayOptimizeResults(results, baseline, strategy) {
           });
         }
         // アシスト覚醒カウント
-        getActiveAwakens(m).forEach(a => {
+        getEffectiveAwakensForSearch(m).forEach(a => {
           awakenCounts[a] = (awakenCounts[a] || 0) + 1;
           assistAwakenCounts[a] = (assistAwakenCounts[a] || 0) + 1;
         });
@@ -4662,7 +4672,7 @@ function buildAwakenDiffHtml(newPicks, baseline, strategy) {
   for (let i = 0; i < 6; i++) {
     const m = newPicks[i];
     if (!m) continue;
-    getActiveAwakens(m).forEach(a => { newAwakenCounts[a] = (newAwakenCounts[a] || 0) + 1; });
+    getEffectiveAwakensForSearch(m).forEach(a => { newAwakenCounts[a] = (newAwakenCounts[a] || 0) + 1; });
   }
 
   // 全覚醒IDを集める（旧・新の両方）
