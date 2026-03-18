@@ -513,11 +513,14 @@ function getSkillInfo(monster) {
  * @param {Object} monster - アシストモンスター
  * @returns {number} 倍率の乗算値（1 = 倍率なし）
  */
-function calcDpsMultiplier(monster) {
+function calcDpsMultiplier(monster, base = null) {
   const active = getEffectiveAwakensForSearch(monster);
   let multiplier = 1;
+  const skipLevitation = base && baseHasLevitation(base);
+
   for (const a of active) {
     if (selectedDpsAwakens.has(a) && awakenMultipliers[a] && awakenMultipliers[a] > 1) {
+      if (a === 106 && skipLevitation) continue; // ベースが既に浮遊持ちならアシストの浮遊は計上しない
       multiplier *= awakenMultipliers[a];
     }
   }
@@ -2611,7 +2614,7 @@ function filterCandidatesForSlot(slotIdx) {
 
     // 火力倍率条件
     if (cond.requiredDpsMultiplier != null && cond.requiredDpsMultiplier > 1) {
-      const mult = calcDpsMultiplier(m);
+      const mult = calcDpsMultiplier(m, base);
       if (mult < cond.requiredDpsMultiplier) return false;
     }
 
@@ -4179,6 +4182,27 @@ function calcSBBreakdown(state) {
 
 // ==================== 最適化検索（6体確定後の向上策） ====================
 
+/**
+ * モンスターの採用上限数を取得
+ */
+function getMonsterDuplicateLimit(monsterNo) {
+  if (!allowDuplicateAssists) return 1;
+  return monsterDupLimits[monsterNo] !== undefined ? monsterDupLimits[monsterNo] : duplicateMaxCount;
+}
+
+/**
+ * 組み合わせ全体の採用数制限をチェック
+ */
+function checkDuplicateLimits(picks) {
+  const counts = {};
+  for (const m of Object.values(picks)) {
+    if (!m) continue;
+    counts[m.no] = (counts[m.no] || 0) + 1;
+    if (counts[m.no] > getMonsterDuplicateLimit(m.no)) return false;
+  }
+  return true;
+}
+
 const OPTIMIZE_STRATEGIES = {
   fire: { label: '🔥 火力向上', targetAwakens: [], useDpsMult: true },
   heal: { label: '🩷 回復力向上', targetAwakens: [47, 104, 3], useDpsMult: false },
@@ -4204,7 +4228,7 @@ function getCurrentBaseline() {
       totalSB += getHasteTurns(m);
       if (delayAsSB) totalSB += getDelayTurns(m);
     }
-    slotMultipliers[i] = calcDpsMultiplier(m);
+    slotMultipliers[i] = calcDpsMultiplier(m, baseMonsters[i]);
   }
 
   return { awakenCounts, totalSB, slotMultipliers };
@@ -4241,7 +4265,7 @@ function checkOptimizeConstraints(newPicks, baseline) {
 
   // 火力倍率: 各キャラごとに維持
   for (let i = 0; i < 6; i++) {
-    const newMult = calcDpsMultiplier(newPicks[i]);
+    const newMult = calcDpsMultiplier(newPicks[i], baseMonsters[i]);
     if (newMult < baseline.slotMultipliers[i]) return false;
   }
 
@@ -4258,7 +4282,7 @@ function calcOptimizeScore(newPicks, baseline, strategy) {
   if (strategy === 'fire') {
     // 火力向上: 各スロットの倍率向上を評価
     for (let i = 0; i < 6; i++) {
-      const newMult = calcDpsMultiplier(newPicks[i]);
+      const newMult = calcDpsMultiplier(newPicks[i], baseMonsters[i]);
       const oldMult = baseline.slotMultipliers[i];
       if (newMult > oldMult) {
         score += (newMult - oldMult) * 100;
@@ -4374,16 +4398,11 @@ async function runOptimizeSearch(strategy) {
 
     for (const candidate of candidates) {
       if (candidate.no === originalMonster.no) continue;
-      if (usedNos.has(candidate.no) && candidate.no !== originalMonster.no) {
-        // 他のスロットで使用中のモンスターは除外（ただし元のモンスターは除く）
-        const isUsedElsewhere = Object.entries(pinnedAssists).some(
-          ([idx, m]) => parseInt(idx) !== i && m.no === candidate.no
-        );
-        if (isUsedElsewhere) continue;
-      }
-
       const newPicks = { ...currentPicks };
       newPicks[i] = candidate;
+
+      // 重複採用制限チェック
+      if (!checkDuplicateLimits(newPicks)) continue;
 
       if (!checkOptimizeConstraints(newPicks, baseline)) continue;
 
@@ -4431,18 +4450,10 @@ async function runOptimizeSearch(strategy) {
       for (const ci of candidatesI) {
         if (optimizeStopRequested) break;
         if (ci.no === origI.no) continue;
-        const isUsedElsewhereI = Object.entries(pinnedAssists).some(
-          ([idx, m]) => parseInt(idx) !== i && parseInt(idx) !== j && m.no === ci.no
-        );
-        if (isUsedElsewhereI) continue;
 
         for (const cj of candidatesJ) {
           if (optimizeStopRequested) break;
           if (cj.no === origJ.no || cj.no === ci.no) continue;
-          const isUsedElsewhereJ = Object.entries(pinnedAssists).some(
-            ([idx, m]) => parseInt(idx) !== i && parseInt(idx) !== j && m.no === cj.no
-          );
-          if (isUsedElsewhereJ) continue;
 
           checkCount++;
           // 非同期yield: 5000回ごとにUIに制御を返す
@@ -4454,6 +4465,9 @@ async function runOptimizeSearch(strategy) {
           const newPicks = { ...currentPicks };
           newPicks[i] = ci;
           newPicks[j] = cj;
+
+          // 重複採用制限チェック
+          if (!checkDuplicateLimits(newPicks)) continue;
 
           if (!checkOptimizeConstraints(newPicks, baseline)) continue;
 
@@ -4538,8 +4552,8 @@ function displayOptimizeResults(results, baseline, strategy) {
       const afterAwakensHtml = getAwakensHtml(after);
       const beforeSkill = getSkillInfo(before);
       const afterSkill = getSkillInfo(after);
-      const beforeMult = calcDpsMultiplier(before);
-      const afterMult = calcDpsMultiplier(after);
+      const beforeMult = calcDpsMultiplier(before, baseMonsters[slotIdx]);
+      const afterMult = calcDpsMultiplier(after, baseMonsters[slotIdx]);
       const multDiff = afterMult - beforeMult;
 
       return `
