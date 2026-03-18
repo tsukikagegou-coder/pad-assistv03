@@ -1,0 +1,641 @@
+<!DOCTYPE html>
+<html lang="ja">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>パズドラ アシスト検討応援ツール</title>
+  <meta name="description" content="パズドラの最適なアシストモンスターの組み合わせを提案するツール。覚醒スキル条件やスキブ数を指定して、最適なアシストを自動計算。">
+  <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+  <!-- Opening Animation overlay -->
+  <div id="opening-animation">
+    <div class="animation-container">
+      <svg viewBox="0 0 400 300" class="opening-svg">
+        <defs>
+          <linearGradient id="rainbow-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" style="stop-color:#ff5f5f" />
+            <stop offset="20%" style="stop-color:#ffbd5f" />
+            <stop offset="40%" style="stop-color:#fff15f" />
+            <stop offset="60%" style="stop-color:#5fff7d" />
+            <stop offset="80%" style="stop-color:#5fb8ff" />
+            <stop offset="100%" style="stop-color:#b85fff" />
+          </linearGradient>
+        </defs>
+        <!-- 6つの四角い枠 (①) -->
+        <g class="slots-group">
+          <rect x="50" y="100" width="40" height="40" rx="4" class="slot-rect" />
+          <rect x="105" y="100" width="40" height="40" rx="4" class="slot-rect" />
+          <rect x="160" y="100" width="40" height="40" rx="4" class="slot-rect" />
+          <rect x="215" y="100" width="40" height="40" rx="4" class="slot-rect" />
+          <rect x="270" y="100" width="40" height="40" rx="4" class="slot-rect" />
+          <rect x="325" y="100" width="40" height="40" rx="4" class="slot-rect" />
+        </g>
+
+        <!-- 6つの虹色四角 (②) -->
+        <g class="rainbow-group">
+          <rect x="50" y="400" width="40" height="40" rx="4" class="rainbow-rect r1" />
+          <rect x="105" y="400" width="40" height="40" rx="4" class="rainbow-rect r2" />
+          <rect x="160" y="400" width="40" height="40" rx="4" class="rainbow-rect r3" />
+          <rect x="215" y="400" width="40" height="40" rx="4" class="rainbow-rect r4" />
+          <rect x="270" y="400" width="40" height="40" rx="4" class="rainbow-rect r5" />
+          <rect x="325" y="400" width="40" height="40" rx="4" class="rainbow-rect r6" />
+        </g>
+
+        <!-- 弾けるエフェクト用のパーティクル (③) -->
+        <g class="burst-group" id="burst-particles"></g>
+
+        <!-- タイトル表示 (③) -->
+        <text x="200" y="200" text-anchor="middle" class="opening-title">アシスト検討応援ツール</text>
+      </svg>
+    </div>
+  </div>
+
+  <!-- Loading Overlay (Initial hidden, will be managed by app.js) -->
+  <div id="loading-overlay" style="display: none;">
+    <div class="loading-spinner"></div>
+    <div class="loading-text">データを読み込み中...</div>
+  </div>
+
+  <!-- Header -->
+  <header class="app-header">
+    <h1 class="app-title">🐲 アシスト検討応援ツール</h1>
+    <p class="app-subtitle">パーティに最適なアシストの組み合わせを見つけよう</p>
+    <div class="info-btn-wrapper" id="btn-show-info" title="取扱説明書を見る">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+        stroke-linejoin="round" class="info-svg">
+        <circle cx="12" cy="12" r="10"></circle>
+        <line x1="12" y1="16" x2="12" y2="12"></line>
+        <line x1="12" y1="8" x2="12.01" y2="8"></line>
+      </svg>
+    </div>
+  </header>
+
+  <!-- Step Indicator -->
+  <nav class="step-indicator" id="step-indicator">
+    <div class="step-dot active" data-step="0">0</div>
+    <div class="step-line" data-line="0"></div>
+    <div class="step-dot" data-step="1">1</div>
+    <div class="step-line" data-line="1"></div>
+    <div class="step-dot" data-step="2">2</div>
+    <div class="step-line" data-line="2"></div>
+    <div class="step-dot" data-step="3">3</div>
+    <div class="step-line" data-line="3"></div>
+    <div class="step-dot" data-step="4">R</div>
+  </nav>
+
+  <main class="app-container">
+
+    <!-- ===== STEP 0: ベースモンスター指定 ===== -->
+    <div class="step-panel active" id="step-0">
+      <div class="section-card">
+        <div class="section-title">
+          <span><span class="emoji">👤</span> STEP 0: ベースモンスターの指定</span>
+          <button id="qr-import-btn" class="btn btn-outline btn-sm" style="margin-left: auto;"
+            onclick="openQrModal()">QRから読込</button>
+        </div>
+        <p class="section-desc">パーティの6体のベースモンスターを指定してください。番号または名前で検索できます。（任意：指定しなくても次のステップに進めます）</p>
+        <div class="slot-tabs" id="base-slot-tabs">
+          <div class="slot-tab active" data-slot="0">リーダー</div>
+          <div class="slot-tab" data-slot="1">サブ1</div>
+          <div class="slot-tab" data-slot="2">サブ2</div>
+          <div class="slot-tab" data-slot="3">サブ3</div>
+          <div class="slot-tab" data-slot="4">サブ4</div>
+          <div class="slot-tab" data-slot="5">助っ人</div>
+        </div>
+        <div id="base-slot-contents"></div>
+      </div>
+      <div class="step-nav">
+        <div></div>
+        <button class="btn btn-primary" onclick="goToStep(1)">次へ ▶</button>
+      </div>
+    </div>
+
+    <!-- ===== STEP 1: 個別条件指定 ===== -->
+    <div class="step-panel" id="step-1">
+      <!-- ベースモンスター情報表示エリア -->
+      <div id="step1-base-summary"></div>
+
+      <div class="section-card">
+        <div class="section-title"><span class="emoji">⚙️</span> STEP 1: スロット別アシスト条件</div>
+        <p class="section-desc">各スロットのアシストに対する条件を設定します。必須覚醒、属性/タイプ条件、スキル使用可否を指定してください。</p>
+        <div class="slot-tabs" id="cond-slot-tabs">
+          <div class="slot-tab active" data-slot="0">リーダー</div>
+          <div class="slot-tab" data-slot="1">サブ1</div>
+          <div class="slot-tab" data-slot="2">サブ2</div>
+          <div class="slot-tab" data-slot="3">サブ3</div>
+          <div class="slot-tab" data-slot="4">サブ4</div>
+          <div class="slot-tab" data-slot="5">助っ人</div>
+        </div>
+        <div id="cond-slot-contents"></div>
+      </div>
+      <div class="step-nav">
+        <button class="btn btn-outline" onclick="goToStep(0)">◀ 戻る</button>
+        <button class="btn btn-primary" onclick="goToStep(2)">次へ ▶</button>
+      </div>
+    </div>
+
+    <!-- ===== STEP 2: 火力覚醒の選択 ===== -->
+    <div class="step-panel" id="step-2">
+      <!-- 前ステップの条件表示エリア -->
+      <div id="step2-prev-summary"></div>
+
+      <div class="section-card">
+        <div class="section-title"><span class="emoji">🔥</span> STEP 2: 有効な火力覚醒の選択</div>
+        <p class="section-desc">このパーティで有効活用できる火力覚醒を選択してください。＋付き覚醒は元覚醒の選択で自動的に含まれます。</p>
+        <div class="field-label">火力覚醒一覧（タップで選択/解除）</div>
+        <div class="icon-grid" id="dps-awakens-grid"></div>
+        <div class="field-label" style="margin-top:12px">選択中の火力覚醒（タップで解除）：</div>
+        <div class="selected-conditions" id="selected-dps-awakens">
+          <span style="color:var(--text-muted);font-size:0.8rem">まだ選択されていません</span>
+        </div>
+      </div>
+      <div class="step-nav">
+        <button class="btn btn-outline" onclick="goToStep(1)">◀ 戻る</button>
+        <button class="btn btn-primary" onclick="goToStep(3)">次へ ▶</button>
+      </div>
+    </div>
+
+    <!-- ===== STEP 3: パーティ全体条件 ===== -->
+    <div class="step-panel" id="step-3">
+      <!-- ベースキャラクター確認（おまけ機能） -->
+      <div id="step3-base-confirmation" class="section-card" style="display:none; padding: 12px;">
+        <div class="section-title" style="font-size: 0.95rem; margin-bottom: 6px;"><span class="emoji">👀</span>
+          ベースモンスター確認</div>
+        <p class="section-desc" style="font-size: 0.75rem; margin-bottom: 8px;">STEP0で入力されたモンスターの一覧と、所持している覚醒の合計を表示します。
+        </p>
+        <div id="step3-base-cards-container" style="display: flex; flex-wrap: wrap; gap: 6px;"></div>
+        <div id="step3-base-awaken-summary"
+          style="margin-top: 8px; border-top: 1px dashed var(--border-color); padding-top: 8px; font-size: 0.8rem;">
+        </div>
+      </div>
+
+      <!-- 事前アシストモンスター確認（折りたたみ） -->
+      <div id="step3-preassist-confirmation" class="section-card" style="display:none; padding: 12px;">
+        <details>
+          <summary class="section-title"
+            style="cursor:pointer; list-style:none; outline:none; font-size: 0.95rem; margin-bottom: 6px;">
+            <span class="emoji">📍</span> 事前アシストモンスター確認
+          </summary>
+          <p class="section-desc" style="font-size: 0.75rem; margin-bottom: 8px;">
+            STEP0で事前入力されたアシストモンスターの一覧と、覚醒合計・実質スキブ数を表示します。
+          </p>
+          <div id="step3-preassist-cards-container" style="display: flex; flex-wrap: wrap; gap: 6px;"></div>
+          <div id="step3-preassist-awaken-summary"
+            style="margin-top: 8px; border-top: 1px dashed var(--border-color); padding-top: 8px; font-size: 0.8rem;">
+          </div>
+          <div id="step3-preassist-sb-summary"
+            style="margin-top: 8px; border-top: 1px dashed var(--border-color); padding-top: 8px; font-size: 0.8rem;">
+          </div>
+        </details>
+      </div>
+
+      <div class="section-card">
+        <div class="section-title"><span class="emoji">🎯</span> STEP 3: パーティ全体で必要な覚醒</div>
+        <div id="step3-preassist-note" style="display:none"></div>
+        <p class="section-desc">アシスト6体合計で欲しい覚醒の種類と個数を指定してください。アイコンをタップするたび数量が増加します。右クリックまたは長押しで減少します。</p>
+        <div class="field-label">覚醒スキル（タップで追加）</div>
+        <div class="icon-grid" id="party-awakens-grid"></div>
+        <div class="field-label" style="margin-top:12px">指定中の必要覚醒（タップで1つ減らす）：</div>
+        <div class="selected-conditions" id="party-required-display">
+          <span style="color:var(--text-muted);font-size:0.8rem">まだ指定されていません</span>
+        </div>
+      </div>
+      <div class="section-card">
+        <div class="section-title"><span class="emoji">⚡</span> スキルブースト設定</div>
+        <p class="section-desc">※アシストモンスターのみで補う必要があるスキルブースト合計数を入力してください</p>
+        <div class="num-input-group">
+          <label>必要スキブ合計：</label>
+          <input type="number" class="num-input" id="required-sb" min="0" value="0">
+          <span style="font-size:0.82rem;color:var(--text-muted)">ターン</span>
+        </div>
+        <div class="toggle-row">
+          <span class="toggle-label">遅延をスキブに加算する</span>
+          <label class="toggle-switch">
+            <input type="checkbox" id="delay-as-sb">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+      </div>
+      <div class="section-card">
+        <div class="section-title"><span class="emoji">👥</span> 同じアシストの複数採用設定</div>
+        <p class="section-desc">同じアシストモンスターを複数スロットで採用することを許可します。</p>
+        <div class="toggle-row">
+          <span class="toggle-label">同じ種類のアシストを複数採用することを許可</span>
+          <label class="toggle-switch">
+            <input type="checkbox" id="allow-duplicate-assists" onchange="toggleDuplicateAssists(this.checked)">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+        <div id="duplicate-count-section" style="display:none; margin-top:10px;">
+          <div class="num-input-group">
+            <label>最大採用数：</label>
+            <input type="number" class="num-input" id="duplicate-max-count" min="2" max="6" value="2"
+              onchange="updateDuplicateMaxCount(this.value)">
+            <span style="font-size:0.82rem;color:var(--text-muted)">体まで</span>
+          </div>
+          <p class="hint-text">※ 採用数は計算結果画面でモンスター個別に変更できます</p>
+        </div>
+      </div>
+      <div class="step-nav">
+        <button class="btn btn-outline" onclick="goToStep(2)">◀ 戻る</button>
+        <button class="btn btn-gold btn-lg btn-search" id="btn-optimize" onclick="runOptimization(event)"><span
+            class="btn-text">🔍 この条件で検索</span></button>
+      </div>
+    </div>
+
+    <!-- ===== STEP 4: 結果表示 ===== -->
+    <div class="step-panel" id="step-4">
+      <div id="search-status-warning"></div>
+
+      <!-- 火力覚醒スイッチ（候補なし時用） -->
+      <div id="dps-toggle-section" style="display:none; margin-bottom:12px;">
+        <div class="section-card" style="border: 2px solid var(--accent-red);">
+          <div class="section-title"><span class="emoji">🚨</span> 条件を緩める</div>
+          <p class="section-desc">候補が見つかりませんでした。火力優先条件を一時的にOFFにして再検索できます。</p>
+          <div id="dps-priority-toggles-container"></div>
+        </div>
+      </div>
+
+      <!-- 計算進捗セクション -->
+      <div id="calc-progress-section" style="display:none">
+        <div class="progress-card">
+          <div class="progress-status" id="progress-status">計算中...</div>
+          <div class="progress-bar-wrap">
+            <div class="progress-bar-inner" id="progress-bar-inner"></div>
+          </div>
+        </div>
+      </div>
+
+
+      <div class="section-card">
+        <div class="section-title"><span class="emoji">🏆</span> 組み合わせ候補</div>
+        <p class="section-desc" id="result-desc"></p>
+        <!-- ベースモンスター表示 -->
+        <div id="result-base-display"></div>
+        <!-- 結果パターン -->
+        <div id="result-container"></div>
+      </div>
+
+      <!-- ブックマークセクション (折りたたみ) -->
+      <div class="section-card" id="bookmark-section" style="display:none">
+        <details>
+          <summary class="section-title"
+            style="cursor:pointer; outline:none; list-style:none; display:flex; align-items:center;">
+            <span class="emoji">🔖</span> ブックマーク済みの候補
+            <span id="bookmark-count"
+              style="margin-left:auto; font-size:0.8rem; background:var(--accent-gold); color:var(--bg-main); padding:2px 8px; border-radius:10px;">0</span>
+          </summary>
+          <div id="bookmark-list-container" style="margin-top:12px"></div>
+        </details>
+      </div>
+
+      <!-- 固定モンスター管理セクション -->
+      <div id="pinned-section" style="display:none">
+        <div class="section-card" style="border:2px solid var(--accent-gold)">
+          <div class="section-title"><span class="emoji">📌</span> 固定済みアシスト</div>
+          <div id="pinned-list"></div>
+          <div style="margin-top:10px;text-align:right">
+            <button class="btn btn-outline btn-sm" onclick="clearAllPins()">全固定を解除して再計算</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 最適化検索セクション -->
+      <div id="optimize-section" style="display:none">
+        <div class="section-card optimize-card">
+          <div class="section-title"><span class="emoji">🔍</span> さらに最適化する</div>
+          <p class="section-desc">現在の覚醒要件を維持しつつ、指定した方針に沿った改善候補を探索します。</p>
+          <div class="optimize-strategy-grid" id="optimize-strategy-buttons">
+            <button class="optimize-strategy-btn fire" onclick="runOptimizeSearch('fire')">
+              <span class="strategy-icon">🔥</span>
+              <span class="strategy-label">火力向上</span>
+              <span class="strategy-desc">より高倍率の火力覚醒を探索</span>
+            </button>
+            <button class="optimize-strategy-btn heal" onclick="runOptimizeSearch('heal')">
+              <span class="strategy-icon">🩷</span>
+              <span class="strategy-label">回復力向上</span>
+              <span class="strategy-desc">チーム回復・回復ドロ強+を追加</span>
+            </button>
+            <button class="optimize-strategy-btn tank" onclick="runOptimizeSearch('tank')">
+              <span class="strategy-icon">💪</span>
+              <span class="strategy-label">耐久力向上</span>
+              <span class="strategy-desc">チームHP・属性軽減を追加</span>
+            </button>
+            <button class="optimize-strategy-btn operate" onclick="runOptimizeSearch('operate')">
+              <span class="strategy-icon">☝️</span>
+              <span class="strategy-label">操作性向上</span>
+              <span class="strategy-desc">操作時間延長＋を追加</span>
+            </button>
+          </div>
+          <div id="optimize-progress" style="display:none">
+            <div class="progress-card" style="margin-top:12px">
+              <div class="progress-status" id="optimize-progress-status">最適化検索中...</div>
+            </div>
+          </div>
+          <div id="optimize-results" style="margin-top:12px"></div>
+        </div>
+      </div>
+
+      <!-- 除外リスト管理 -->
+      <div class="section-card" id="exclusion-manager-section" style="display:none">
+        <div class="section-title"><span class="emoji">🚫</span> 除外済みモンスターの管理</div>
+        <div class="exclusion-list" id="exclusion-list-container"></div>
+        <div style="margin-top:12px; text-align:right">
+          <button class="btn btn-outline btn-sm" onclick="clearAllExclusions()">全ての除外を解除</button>
+        </div>
+      </div>
+
+      <!-- 採用数制限管理 -->
+      <div class="section-card" id="dup-limit-manager-section" style="display:none">
+        <div class="section-title"><span class="emoji">🔢</span> 採用数制限済みモンスターの管理</div>
+        <div class="exclusion-list" id="dup-limit-list-container"></div>
+        <div style="margin-top:12px; text-align:right">
+          <button class="btn btn-outline btn-sm" onclick="clearAllDupLimits()">全ての制限を解除</button>
+        </div>
+      </div>
+
+      <div class="step-nav">
+        <button class="btn btn-outline" onclick="goToStep(3)">◀ 条件を変更</button>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- フローティングアクションボタン (FAB) -->
+  <div class="fab-container left" id="fab-bookmarks" style="display:none" onclick="toggleBookmarkOverlay()"
+    title="ブックマークを確認">
+    <div class="fab-btn bookmark-btn">
+      <svg class="icon-svg" viewBox="0 0 24 24">
+        <path d="M17,3H7C5.9,3,5,3.9,5,5v16l7-3l7,3V5C19,3.9,18.1,3,17,3z"></path>
+      </svg>
+      <span class="fab-label">ブックマーク済み</span>
+    </div>
+  </div>
+
+  <!-- 検索モード選択ポップアップ用オーバーレイ -->
+  <div class="popup-backdrop" id="search-mode-backdrop" onclick="hideSearchModePopup()"></div>
+
+  <div class="fab-container right" id="fab-recalc" style="display:none" onclick="handleRecalcClick(event)"
+    title="除外して再計算">
+    <!-- 検索モード選択ポップアップ -->
+    <div class="search-mode-popup" id="search-mode-popup">
+      <div class="popup-title">
+        <svg class="popup-title-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="10" />
+          <line x1="12" y1="8" x2="12" y2="12" />
+          <line x1="12" y1="16" x2="12.01" y2="16" />
+        </svg>
+        検索モードを選択
+      </div>
+
+      <div class="search-mode-btn fast" onclick="event.stopPropagation(); selectSearchMode('fast', this)">
+        <div class="mode-icon-wrap">
+          <svg class="mode-icon-svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+          </svg>
+        </div>
+        <div class="mode-text">
+          <div class="mode-label">⚡ 高速検索</div>
+          <div class="mode-desc">候補を絞り込んで素早く結果を表示<br>（数秒〜十数秒）</div>
+        </div>
+        <svg class="mode-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+          stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="9 18 15 12 9 6" />
+        </svg>
+      </div>
+
+      <div class="search-mode-btn thorough" onclick="event.stopPropagation(); selectSearchMode('thorough', this)">
+        <div class="mode-icon-wrap">
+          <svg class="mode-icon-svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="8" />
+            <line x1="21" y1="21" x2="16.65" y2="16.65" />
+            <line x1="11" y1="8" x2="11" y2="14" />
+            <line x1="8" y1="11" x2="14" y2="11" />
+          </svg>
+        </div>
+        <div class="mode-text">
+          <div class="mode-label">🔍 じっくり検索</div>
+          <div class="mode-desc">全候補を総当たりで検索<br>（数十秒〜数分かかる場合あり）</div>
+        </div>
+        <svg class="mode-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+          stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="9 18 15 12 9 6" />
+        </svg>
+      </div>
+    </div>
+
+    <div class="fab-btn recalc-btn" id="recalc-btn-el">
+      <svg class="icon-svg" viewBox="0 0 24 24" id="recalc-icon-default">
+        <path
+          d="M17.65,6.35C16.2,4.9,14.21,4,12,4c-4.42,0-7.99,3.58-7.99,8s3.57,8,7.99,8c3.73,0,6.84-2.55,7.73-6h-2.08 c-0.82,2.33-3.04,4-5.65,4c-3.31,0-6-2.69-6-6s2.69-6,6-6c1.66,0,3.14,0.69,4.22,1.78L13,11h7V4L17.65,6.35z">
+        </path>
+      </svg>
+      <div class="fab-bg-container">
+        <svg class="fab-bg-svg" viewBox="0 0 200 100" preserveAspectRatio="xMidYMid slice">
+          <defs>
+            <filter id="blur">
+              <feGaussianBlur in="SourceGraphic" stdDeviation="15" />
+            </filter>
+          </defs>
+          <g filter="url(#blur)">
+            <circle cx="20%" cy="50%" r="60" fill="#6366f1">
+              <animate attributeName="cx" values="20%;80%;20%" dur="2s" repeatCount="indefinite" />
+              <animate attributeName="fill" values="#6366f1;#ec4899;#6366f1" dur="3s" repeatCount="indefinite" />
+            </circle>
+            <circle cx="80%" cy="50%" r="50" fill="#a855f7">
+              <animate attributeName="cx" values="80%;20%;80%" dur="2.5s" repeatCount="indefinite" />
+              <animate attributeName="fill" values="#a855f7;#fbbf24;#a855f7" dur="3.75s" repeatCount="indefinite" />
+            </circle>
+            <circle cx="50%" cy="50%" r="70" fill="#f43f5e">
+              <animate attributeName="cy" values="20%;80%;20%" dur="1.75s" repeatCount="indefinite" />
+              <animate attributeName="fill" values="#f43f5e;#23d5ab;#f43f5e" dur="2.5s" repeatCount="indefinite" />
+            </circle>
+          </g>
+        </svg>
+      </div>
+      <div class="loading-icon-container" id="recalc-icon-loading">
+        <svg class="premium-loader-svg" viewBox="0 0 50 50">
+          <circle cx="25" cy="25" r="20" stroke="white" fill="none"></circle>
+        </svg>
+      </div>
+      <svg class="icon-svg" viewBox="0 0 24 24" id="recalc-icon-stop" style="display:none">
+        <rect x="6" y="6" width="12" height="12" rx="2" fill="white"></rect>
+      </svg>
+      <span class="fab-label" id="recalc-label">再計算</span>
+    </div>
+  </div>
+
+  <!-- QR Import Modal Overlay -->
+  <div id="qr-modal-overlay" class="modal-overlay" style="display: none;">
+    <div class="modal-content" style="max-width: 95%; width: 500px;">
+      <div class="modal-header">
+        <h2>📷 QRコードを利用</h2>
+        <span class="modal-close" onclick="closeQrModal()">&times;</span>
+      </div>
+      <div class="modal-body" style="text-align: center;">
+        <p class="section-desc" style="margin-bottom: 20px;">PDCの編成QRコード画像を読み込みます。</p>
+
+        <div style="display: flex; flex-direction: column; gap: 16px;">
+          <!-- Camera Scan Option -->
+          <div class="search-mode-btn fast" id="qr-camera-btn" onclick="startQrCamera()" style="margin-bottom: 0;">
+            <div class="mode-icon-wrap">
+              <svg class="mode-icon-svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2"
+                stroke-linecap="round" stroke-linejoin="round">
+                <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"></path>
+                <circle cx="12" cy="13" r="4"></circle>
+              </svg>
+            </div>
+            <div class="mode-text" style="text-align: left;">
+              <div class="mode-label">📸 カメラで読み込む</div>
+              <div class="mode-desc">スマホやPCのカメラで直接QRコードをスキャン</div>
+            </div>
+            <svg class="mode-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+              stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="9 18 15 12 9 6" />
+            </svg>
+          </div>
+
+          <div id="qr-video-container"
+            style="display: none; border: 2px solid rgba(59, 130, 246, 0.5); border-radius: 12px; overflow: hidden; position: relative; background: #000;">
+            <video id="qr-video" width="100%" playsinline style="display: block;"></video>
+            <div
+              style="position: absolute; bottom: 0; left: 0; right: 0; padding: 12px; background: rgba(0,0,0,0.7); color: white; display: flex; justify-content: space-between; align-items: center;">
+              <span style="font-size: 0.85rem; font-weight: bold;">カメラにかざしてください</span>
+              <button class="btn btn-sm"
+                style="background: var(--accent-red); color: white; border: none; padding: 6px 16px; border-radius: 6px;"
+                onclick="stopQrCamera(); event.stopPropagation();">キャンセル</button>
+            </div>
+          </div>
+
+          <!-- File Upload Option -->
+          <label class="search-mode-btn thorough" style="cursor: pointer; margin-bottom: 0;">
+            <div class="mode-icon-wrap">
+              <svg class="mode-icon-svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2"
+                stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                <circle cx="8.5" cy="8.5" r="1.5"></circle>
+                <polyline points="21 15 16 10 5 21"></polyline>
+              </svg>
+            </div>
+            <div class="mode-text" style="text-align: left;">
+              <div class="mode-label">🖼 画像ファイルから読み込む</div>
+              <div class="mode-desc">保存したPDC編成の画像ファイルを選択</div>
+            </div>
+            <input type="file" id="qr-file-input" accept="image/*" style="display: none;">
+            <svg class="mode-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+              stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="9 18 15 12 9 6" />
+            </svg>
+          </label>
+          <div id="qr-file-status" style="font-size: 0.85rem; color: var(--text-muted); min-height: 20px;"></div>
+        </div>
+
+        <!-- Hidden Canvas for QR processing -->
+        <canvas id="qr-canvas" style="display: none;"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <!-- Bookmark Overlay Modal -->
+  <div id="bookmark-modal-overlay" class="modal-overlay" style="display: none;">
+    <div class="modal-content" style="max-width: 95%; width: 900px;">
+      <div class="modal-header">
+        <h2>🔖 ブックマーク済みの組み合わせ</h2>
+        <div style="display:flex; align-items:center; gap:8px; margin-left:auto;">
+          <button class="btn btn-gold btn-sm" id="btn-open-comparison" onclick="openComparisonTable()"
+            style="font-size:0.78rem; padding:6px 14px;">
+            📊 一覧表で比較
+          </button>
+          <span class="modal-close" onclick="toggleBookmarkOverlay()">&times;</span>
+        </div>
+      </div>
+      <div class="modal-body">
+        <div id="bookmark-modal-list"></div>
+        <div id="bookmark-empty-msg" style="text-align:center; padding:40px; color:var(--text-muted);">
+          ブックマークされた組み合わせはありません。
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Comparison Table Modal -->
+  <div id="comparison-table-modal" class="modal-overlay" style="display: none;">
+    <div class="modal-content" style="max-width: 98%; width: 1200px;">
+      <div class="modal-header">
+        <h2>📊 ブックマーク比較表</h2>
+        <div style="display:flex; align-items:center; gap:8px; margin-left:auto;">
+          <button class="btn btn-gold btn-sm" onclick="saveComparisonAsImage()"
+            style="font-size:0.78rem; padding:6px 14px;">
+            📥 画像として保存
+          </button>
+          <span class="modal-close" onclick="closeComparisonTable()">&times;</span>
+        </div>
+      </div>
+      <div class="modal-body" style="padding:0;">
+        <div id="comparison-table-content"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Info Modal Overlay -->
+  <div id="info-modal-overlay" class="modal-overlay" style="display: none;">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2>取扱説明書</h2>
+        <span class="modal-close" id="btn-close-info">&times;</span>
+      </div>
+      <div class="modal-body">
+        <pre id="info-text-content">読み込み中...</pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- QR Code Display Modal -->
+  <div id="qr-display-modal" class="modal-overlay" style="display: none;">
+    <div class="modal-content" style="max-width: 95%; width: 420px;">
+      <div class="modal-header">
+        <h2>📱 QRコード</h2>
+        <span class="modal-close" onclick="closeQrDisplayModal()">&times;</span>
+      </div>
+      <div class="modal-body" style="text-align: center; padding: 24px;">
+        <p class="section-desc" style="margin-bottom: 16px;">PDCで読み込み可能なQRコードです</p>
+        <div id="qr-display-canvas-container"></div>
+        <p id="qr-display-error" style="display:none; color:var(--accent-red); margin-top:12px;"></p>
+      </div>
+    </div>
+  </div>
+
+  <footer style="text-align:right;padding:8px 16px;font-size:0.7rem;color:#666;opacity:0.6;">
+    v1.0.7 / 最終修正: 2026-03-15
+  </footer>
+
+  <!-- SVGフィルター定義（Gooeyエフェクト。コントラストを強めにして粘り気を強調） -->
+  <svg width="0" height="0" style="position:absolute;">
+    <defs>
+      <filter id="gooey-filter" x="-50%" y="-50%" width="200%" height="200%">
+        <feGaussianBlur in="SourceGraphic" stdDeviation="15" result="blur" />
+        <feColorMatrix in="blur" mode="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 35 -15" result="gooey" />
+        <feComposite in="SourceGraphic" in2="gooey" operator="atop" />
+      </filter>
+    </defs>
+  </svg>
+
+  <!-- Gooey効果を適用するコンテナ（検索ボタン液体化アニメーション用） -->
+  <div class="gooey-container" id="gooey-container"></div>
+
+  <!-- html2canvas for image export -->
+  <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+  <!-- jsQR library for QR parsing -->
+  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+  <!-- QR code generation library -->
+  <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
+  <script src="app.js"></script>
+</body>
+
+</html>
