@@ -580,6 +580,27 @@ function awakenName(id) { return awakenNames[id] || `覚醒${id}`; }
 function attrName(id) { return attrNames[id] || `属性${id}`; }
 function typeName(id) { return typeNames[id] || `タイプ${id}`; }
 
+/**
+ * 覚醒アイコンのHTMLを生成
+ * @param {number} id 覚醒ID
+ * @param {boolean} isIneffective 既にベースが持っているなどの理由で効果がない場合
+ * @param {boolean} isDisabled 覚醒アシストが無効な場合など
+ */
+function renderAwakenIcon(id, isIneffective = false, isDisabled = false) {
+  const src = awakenIcon(id);
+  const title = awakenName(id);
+  const classes = [];
+  if (isDisabled) classes.push('disabled-awaken');
+  if (isIneffective) classes.push('ineffective-awaken');
+  
+  const imgHtml = `<img src="${src}" title="${title}" class="${classes.join(' ')}">`;
+  
+  if (isIneffective) {
+    return `<div class="awaken-icon-wrapper">${imgHtml}<span class="ineffective-awaken-overlay">❌</span></div>`;
+  }
+  return imgHtml;
+}
+
 // 有効な覚醒IDリスト（表示用）
 function getValidAwakenIds() {
   return Object.keys(awakenNames)
@@ -753,10 +774,14 @@ function selectBaseMonster(slotIdx, monster) {
   `;
   info.classList.add('show');
 
-  // タブのラベル更新（No.＋フル名前）
   const tab = document.querySelector(`#base-slot-tabs .slot-tab[data-slot="${slotIdx}"]`);
   if (tab) {
     tab.innerHTML = `<span class="tab-no">No.${monster.no}</span><span class="tab-name">${monster.name}</span>`;
+  }
+
+  // ベースが変わったので、もし事前アシストがあれば表示（浮遊の活性状態など）を更新する
+  if (pinnedAssists[slotIdx]) {
+    updatePreAssistDisplay(slotIdx);
   }
 }
 
@@ -789,8 +814,8 @@ function searchAssistMonsters(query, resultsEl, slotIdx) {
 
 function selectPreAssist(slotIdx, monster) {
   pinnedAssists[slotIdx] = monster;
-
-  const pinned = document.getElementById(`pre-assist-pinned-${slotIdx}`);
+  updatePreAssistDisplay(slotIdx);
+  
   const details = document.getElementById(`pre-assist-details-${slotIdx}`);
   const assistInput = document.getElementById(`assist-search-${slotIdx}`);
   const assistResults = document.getElementById(`assist-results-${slotIdx}`);
@@ -798,26 +823,40 @@ function selectPreAssist(slotIdx, monster) {
   assistResults.classList.remove('show');
   if (assistInput) assistInput.value = '';
   if (details) details.removeAttribute('open');
+}
+
+/**
+ * STEP 0 の事前アシスト表示を更新する
+ * ベースモンスターの変更時にも呼び出される
+ */
+function updatePreAssistDisplay(slotIdx) {
+  const monster = pinnedAssists[slotIdx];
+  if (!monster) return;
+
+  const pinned = document.getElementById(`pre-assist-pinned-${slotIdx}`);
+  if (!pinned) return;
 
   const attrs = (monster.attributes || []).filter((a, idx) => a != null && (a > 0 || (idx === 0 && a === 0)));
   const types = (monster.types || []).filter(t => t > 0);
   const awakens = getActiveAwakens(monster);
   const skill = getSkillInfo(monster);
 
+  const skipLevitation = baseMonsters[slotIdx] && baseHasLevitation(baseMonsters[slotIdx]);
+
   let awakensHtml = '';
   if (isVanishingAssist(monster) && getVanishGrantedAwakens(monster)) {
     const granted = getVanishGrantedAwakens(monster);
     awakensHtml = `
       <div class="vanish-original">
-        ${awakens.map(a => `<img src="${awakenIcon(a)}" title="${awakenName(a)}" class="${hasAwakenAssist(monster) ? '' : 'disabled-awaken'}">`).join('')}
+        ${awakens.map(a => renderAwakenIcon(a, a === 106 && skipLevitation, !hasAwakenAssist(monster))).join('')}
       </div>
       <span class="vanish-plus">＋</span>
       <div class="vanish-granted">
-        ${granted.map(a => `<img src="${awakenIcon(a)}" title="${awakenName(a)}" class="${hasAwakenAssist(monster) ? '' : 'disabled-awaken'}">`).join('')}
+        ${granted.map(a => renderAwakenIcon(a, a === 106 && skipLevitation, !hasAwakenAssist(monster))).join('')}
       </div>
     `;
   } else {
-    awakensHtml = awakens.map(a => `<img src="${awakenIcon(a)}" title="${awakenName(a)}" class="${hasAwakenAssist(monster) ? '' : 'disabled-awaken'}">`).join('');
+    awakensHtml = awakens.map(a => renderAwakenIcon(a, a === 106 && skipLevitation, !hasAwakenAssist(monster))).join('');
   }
 
   pinned.innerHTML = `
@@ -2761,20 +2800,21 @@ function buildResultCard(result, idx, isRealtime) {
     const dupLimit = monsterDupLimits[m.no];
     const isDupLimited = allowDuplicateAssists && dupLimit !== undefined && dupSeen[m.no] > dupLimit;
 
+    const skipLevitation = baseMon && baseHasLevitation(baseMon);
     let awakensHtml = '';
     if (isVanishingAssist(m) && getVanishGrantedAwakens(m)) {
       const granted = getVanishGrantedAwakens(m);
       awakensHtml = `
         <div class="vanish-original">
-          ${allAw.map(a => `<img src="${awakenIcon(a)}" title="${awakenName(a)}">`).join('')}
+          ${allAw.map(a => renderAwakenIcon(a, a === 106 && skipLevitation, !hasAwakenAssist(m))).join('')}
         </div>
         <span class="vanish-plus">＋</span>
         <div class="vanish-granted">
-          ${granted.map(a => `<img src="${awakenIcon(a)}" title="${awakenName(a)}">`).join('')}
+          ${granted.map(a => renderAwakenIcon(a, a === 106 && skipLevitation, !hasAwakenAssist(m))).join('')}
         </div>
       `;
     } else {
-      awakensHtml = allAw.map(a => `<img src="${awakenIcon(a)}" title="${awakenName(a)}" class="${hasAwakenAssist(m) ? '' : 'disabled-awaken'}">`).join('');
+      awakensHtml = allAw.map(a => renderAwakenIcon(a, a === 106 && skipLevitation, !hasAwakenAssist(m))).join('');
     }
 
     const isAssistAny = String(m.no).startsWith('any-');
@@ -2894,11 +2934,10 @@ function displayResults(results) {
             <div class="rbc-label">${getRoleName(i)} ベース</div>
             <div class="rbc-name" title="${b.name}">${getMonsterIconHtml(b.no)} No.${b.no} ${b.name}</div>
             <div class="rbc-skill">
-              ${skill ? `<strong>${skill.name}</strong><br>(CT:${skill.baseTurn}→${skill.minTurn})<br>${skill.description.substring(0, 30)}${skill.description.length > 30 ? '...' : ''}` : 'スキル不明'}
+              ${skill ? `<strong>${skill.name}</strong><br>(CT:${skill.baseTurn}→${skill.minTurn})<br>${skill.description}` : 'スキル不明'}
             </div>
             <div class="rbc-awakens">
-              ${awakens.slice(0, 8).map(a => `<img src="${awakenIcon(a)}" title="${awakenName(a)}">`).join('')}
-              ${awakens.length > 8 ? '...' : ''}
+              ${awakens.map(a => `<img src="${awakenIcon(a)}" title="${awakenName(a)}">`).join('')}
             </div>
           </div>`;
       } else {
