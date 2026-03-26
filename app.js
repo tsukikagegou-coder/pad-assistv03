@@ -62,6 +62,10 @@ let pinnedAssists = {};
 let bookmarkedResults = [];
 let bookmarkFabTimer = null;
 
+// 比較表のユーザー入力保持
+let comparisonTableUserTitle = '';
+let comparisonTableUserMemo = '';
+
 // 検索モード（true: 高速=スコアリング絞り込み, false: 総当たり=全数探索）
 let searchModeFast = true;
 let searchModePopupActive = false;
@@ -3280,7 +3284,8 @@ function renderComparisonTable() {
   let html = '<div class="ct-wrap">';
 
   // ===== タイトル入力欄 =====
-  html += '<input type="text" class="bookmark-mod-title" placeholder="タイトルを入力..." value="">';
+  html += `<input type="text" class="bookmark-mod-title" placeholder="タイトルを入力..." value="${comparisonTableUserTitle.replace(/"/g, '&quot;')}">`;
+
 
   // ===== 全体コンテナ =====
   html += '<div style="display:flex; justify-content:space-between; gap:20px; align-items:stretch; flex-wrap:wrap;">';
@@ -3407,7 +3412,7 @@ function renderComparisonTable() {
   // ===== 右側：MEMO欄 =====
   html += '<div class="ct-memo-section" style="flex:1.2; display:flex; flex-direction:column; background:var(--bg-card); border:1px solid var(--border-color); border-radius:8px; padding:12px; min-width:200px;">';
   html += '<div class="ct-prereq-title" style="margin-bottom:6px; font-size:0.9rem;">📝 MEMO</div>';
-  html += '<textarea class="bookmark-mod-memo" placeholder="メモを入力..." style="flex:1; width:100%; resize:none; background:var(--bg-input); border:1px solid var(--border-color); border-radius:6px; padding:6px 8px; color:var(--text-primary); font-family:var(--font-main); font-size:0.85rem; outline:none; transition:border-color 0.2s; min-height:60px;"></textarea>';
+  html += `<textarea class="bookmark-mod-memo" placeholder="メモを入力..." style="flex:1; width:100%; resize:none; background:var(--bg-input); border:1px solid var(--border-color); border-radius:6px; padding:6px 8px; color:var(--text-primary); font-family:var(--font-main); font-size:0.85rem; outline:none; transition:border-color 0.2s; min-height:60px;">${comparisonTableUserMemo.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</textarea>`;
   html += '</div>';
 
   html += '</div>'; // 左右コンテナ 終了
@@ -3554,6 +3559,16 @@ function renderComparisonTable() {
 
   container.innerHTML = html;
 
+  // ユーザー入力の変更をグローバル変数に保持
+  const titleEl = container.querySelector('.bookmark-mod-title');
+  if (titleEl) {
+    titleEl.addEventListener('input', () => { comparisonTableUserTitle = titleEl.value; });
+  }
+  const memoEl = container.querySelector('.bookmark-mod-memo');
+  if (memoEl) {
+    memoEl.addEventListener('input', () => { comparisonTableUserMemo = memoEl.value; });
+  }
+
   // QRコードを非同期で描画
   if (allBaseFilledForQr) {
     results.forEach((res, i) => {
@@ -3587,6 +3602,11 @@ async function saveComparisonAsImage() {
     overflow: content.style.overflow,
     overflowX: content.style.overflowX
   };
+
+  // --- スクロール位置リセット: モーダルボディのスクロールを先頭に戻して画像化レイアウト崩れを防止 ---
+  const modalBody = document.querySelector('#comparison-table-modal .modal-body');
+  const savedScrollTop = modalBody ? modalBody.scrollTop : 0;
+  if (modalBody) modalBody.scrollTop = 0;
 
   // 📝 html2canvasはinput/textareaの現在の入力値を自動で拾わない場合があるため、
   // 描画前にDOMのvalue/textContent属性に明示的に書き込む
@@ -3697,6 +3717,9 @@ async function saveComparisonAsImage() {
       scrollContainer.style.width = originalScrollStyle.width;
     }
 
+    // スクロール位置を復元
+    if (modalBody) modalBody.scrollTop = savedScrollTop;
+
     // DataURL → Blob → ダウンロード
     const dataUrl = canvas.toDataURL('image/png');
     const byteString = atob(dataUrl.split(',')[1]);
@@ -3743,6 +3766,9 @@ async function saveComparisonAsImage() {
       scrollContainer.style.overflowX = originalScrollStyle.overflowX;
       scrollContainer.style.width = originalScrollStyle.width;
     }
+
+    // スクロール位置を復元
+    if (modalBody) modalBody.scrollTop = savedScrollTop;
 
     console.error('画像保存エラー:', e);
     if (btn) {
