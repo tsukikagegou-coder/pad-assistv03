@@ -54,6 +54,8 @@ let monsterDupLimits = {};
 // 計算制御
 let stopRequested = false;
 let dfsIterCount = 0;
+let isOptimizing = false;   // 計算実行中フラグ
+let pendingRecalc = false;  // 計算中に条件変更があった場合の再計算予約フラグ
 
 // 固定アシスト { slotIdx: monster }
 let pinnedAssists = {};
@@ -1778,8 +1780,29 @@ function updatePartyRequiredDisplay() {
 
 function stopOptimization() {
   stopRequested = true;
+  pendingRecalc = false; // ユーザーが明示的に停止した場合は再計算予約もクリア
   const st = document.getElementById('progress-status');
   if (st) st.textContent = '計算を停止中...';
+}
+
+// 計算中は再計算を予約し、非計算中は即座に再計算を実行する安全な呼び出し
+function safeRunOptimization() {
+  if (isOptimizing) {
+    pendingRecalc = true;
+    showPendingRecalcNotice();
+  } else {
+    runOptimization();
+  }
+}
+
+// 計算中に条件変更があった場合の通知表示
+function showPendingRecalcNotice() {
+  const st = document.getElementById('progress-status');
+  if (!st) return;
+  const currentText = st.textContent;
+  // 既に通知が含まれている場合は追加しない
+  if (currentText.includes('※')) return;
+  st.textContent = currentText + ' ※条件変更あり：計算完了後に自動で再計算します';
 }
 
 function showProgressUI() {
@@ -2035,6 +2058,8 @@ async function runOptimization(e) {
   goToStep(4);
   stopRequested = false;
   dfsIterCount = 0;
+  isOptimizing = true;
+  pendingRecalc = false;
   showProgressUI();
 
   // 火力解除セクションを隠す
@@ -2054,9 +2079,17 @@ async function runOptimization(e) {
     const results = await optimize();
     hideProgressUI();
     resetRecalcBtn();
+    isOptimizing = false;
     displayResults(results);
+
+    // 計算中に条件変更があった場合、自動で再計算を実行
+    if (pendingRecalc) {
+      pendingRecalc = false;
+      runOptimization();
+    }
   } catch (err) {
     hideProgressUI();
+    isOptimizing = false;
     console.error('Optimization error:', err);
 
     // 火力優先が原因で0件の場合の救済措置
@@ -2068,6 +2101,12 @@ async function runOptimization(e) {
     const rc2 = document.getElementById('result-container');
     if (rc2) {
       rc2.innerHTML = `<div class="empty-state"><div class="emoji-lg">⚠️</div><p>${err.message}</p></div>`;
+    }
+
+    // エラー時も条件変更があれば再計算
+    if (pendingRecalc) {
+      pendingRecalc = false;
+      runOptimization();
     }
   }
 }
@@ -2098,7 +2137,7 @@ function showDpsToggleSection() {
 function toggleDpsPriority(slotIdx, isChecked) {
   // ONOFFを反転させて再計算
   slotConditions[slotIdx].dpsPriority = !isChecked;
-  runOptimization();
+  safeRunOptimization();
 }
 
 async function optimize() {
@@ -2367,10 +2406,16 @@ async function runDFS(slotCandidates, searchOrder, initialAwakens, initialSB, to
   function addRealtimeResult(solution) {
     const rc = document.getElementById('result-container');
     const st = document.getElementById('progress-status');
-    if (st) st.textContent = `計算中... 完全一致 ${fullMatchSolutions.length}件 発見`;
+    if (st) {
+      let statusText = `計算中... 完全一致 ${fullMatchSolutions.length}件 発見`;
+      if (pendingRecalc) statusText += ' ※条件変更あり：計算完了後に自動で再計算します';
+      st.textContent = statusText;
+    }
     if (!rc) return;
     const card = buildResultCard(solution, fullMatchSolutions.length - 1, true);
     rc.appendChild(card);
+    // リアルタイム表示カードに即座にイベントをバインド（計算中でも操作可能にする）
+    bindCardEvents(card, solution, fullMatchSolutions.length - 1);
   }
 
   // 非同期 solve
@@ -2516,6 +2561,16 @@ async function runDFS(slotCandidates, searchOrder, initialAwakens, initialSB, to
       const effectiveCurrentSB = currentSB + (delayAsSB ? currentMaxDelay : 0);
       if (effectiveNextSB < requiredSB) {
         monsterScore += (effectiveNextSB - effectiveCurrentSB) * 100;
+      }
+
+      // アシストボーナス加点: ベースの主属性とアシストの主属性が一致、またはアシストが無属性の場合
+      const baseMon = baseMonsters[slotIdx];
+      if (baseMon && m.attributes) {
+        const baseAttr = (baseMon.attributes || [])[0];
+        const assistAttr = (m.attributes || [])[0];
+        if (baseAttr != null && (assistAttr === 0 || assistAttr === baseAttr)) {
+          monsterScore += 15;
+        }
       }
 
       await solve(depth + 1, [...currentPicks, { slotIdx, monster: m }], nextAwakens, nextAssistAwakens, nextSB, nextMaxDelay, currentScore + monsterScore);
@@ -3009,6 +3064,107 @@ function displayResults(results) {
   bindResultEvents(container, results);
 }
 
+// 個別カード用のイベントバインド（リアルタイム表示時に即座に呼び出し、計算中でも操作可能にする）
+function bindCardEvents(card, solution, idx) {
+  // 除外ボタン
+  card.querySelectorAll('.btn-exclude').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      const monsterNo = parseInt(btn.dataset.no);
+      if (allowDuplicateAssists) {
+        e.stopPropagation();
+        showExcludeActionPopup(btn, monsterNo);
+        return;
+      }
+      await performFullExclusion(monsterNo);
+      // 計算中なら再計算を予約
+      if (isOptimizing) {
+        pendingRecalc = true;
+        showPendingRecalcNotice();
+      }
+    });
+  });
+
+  // 除外解除イベント
+  card.querySelectorAll('.btn-restore-exclusion').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const monsterNo = parseInt(btn.dataset.no);
+      restoreExclusion(monsterNo);
+    });
+  });
+
+  // 強制火力ボタン
+  card.querySelectorAll('.btn-forced-dps').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const slot = parseInt(btn.dataset.slot);
+      slotConditions[slot].forcedDps = true;
+      safeRunOptimization();
+    });
+  });
+
+  // 📌 固定ボタン
+  card.querySelectorAll('.btn-pin').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const slotIdx = parseInt(btn.dataset.slot);
+      const monsterNo = parseInt(btn.dataset.no);
+      const monster = assistMonsters.find(m => m.no === monsterNo);
+      if (!monster) return;
+
+      if (pinnedAssists[slotIdx] && pinnedAssists[slotIdx].no === monsterNo) {
+        delete pinnedAssists[slotIdx];
+      } else {
+        pinnedAssists[slotIdx] = monster;
+      }
+
+      // 表示中の全パターンの同一モンスターのバッジを同期更新
+      const allSameMonsters = document.querySelectorAll(`.result-assist-card[data-monster-no="${monsterNo}"] .btn-pin`);
+      const isCurrentMonsterPinnedAnywhere = Object.values(pinnedAssists).some(p => p.no === monsterNo);
+
+      allSameMonsters.forEach(pinBtn => {
+        const sIdx = parseInt(pinBtn.dataset.slot);
+        const isActuallyPinnedInThisSlot = pinnedAssists[sIdx] && pinnedAssists[sIdx].no === monsterNo;
+        const parentPattern = pinBtn.closest('.result-pattern');
+        const sameNoInPattern = parentPattern ? parentPattern.querySelectorAll(`.result-assist-card[data-monster-no="${monsterNo}"]`).length : 0;
+        const isDupInPattern = sameNoInPattern > 1;
+
+        if (isDupInPattern) {
+          if (isActuallyPinnedInThisSlot) {
+            pinBtn.classList.add('pinned');
+            pinBtn.textContent = '📍固定中';
+          } else {
+            pinBtn.classList.remove('pinned');
+            pinBtn.textContent = '📌';
+          }
+        } else {
+          if (isActuallyPinnedInThisSlot || (isCurrentMonsterPinnedAnywhere && !pinnedAssists[sIdx])) {
+            pinBtn.classList.add('pinned');
+            pinBtn.textContent = '📍固定中';
+          } else {
+            pinBtn.classList.remove('pinned');
+            pinBtn.textContent = '📌';
+          }
+        }
+      });
+
+      updatePinnedUI();
+      // 計算中の固定変更は次回再計算に反映（現在は自動計算を呼ばない仕様）
+    });
+  });
+
+  // ブックマークボタン
+  card.querySelectorAll('.btn-bookmark-card').forEach(btn => {
+    btn.addEventListener('click', () => {
+      toggleBookmark(solution, btn);
+    });
+  });
+
+  // QRコードボタン
+  card.querySelectorAll('.btn-qr-card').forEach(btn => {
+    btn.addEventListener('click', () => {
+      if (solution) showQrCodePopup(solution.picks);
+    });
+  });
+}
+
 function bindResultEvents(container, results) {
   // 除外ボタンイベント
   container.querySelectorAll('.btn-exclude').forEach(btn => {
@@ -3040,7 +3196,7 @@ function bindResultEvents(container, results) {
     btn.addEventListener('click', () => {
       const slot = parseInt(btn.dataset.slot);
       slotConditions[slot].forcedDps = true;
-      runOptimization();
+      safeRunOptimization();
     });
   });
 
@@ -3805,7 +3961,7 @@ function updateExclusionUI() {
     div.querySelector('.btn-restore').addEventListener('click', () => {
       excludedMonsterNos.delete(no);
       updateExclusionUI();
-      runOptimization();
+      safeRunOptimization();
     });
     container.appendChild(div);
   });
@@ -3814,7 +3970,7 @@ function updateExclusionUI() {
 function clearAllExclusions() {
   excludedMonsterNos.clear();
   updateExclusionUI();
-  runOptimization();
+  safeRunOptimization();
 }
 
 // ==================== 同種アシスト / 除外ポップアップ ====================
@@ -4141,7 +4297,7 @@ function updatePinnedUI() {
     recalcBtn.className = 'btn btn-gold btn-sm btn-pinned-recalc';
     recalcBtn.style.marginTop = '10px';
     recalcBtn.textContent = '🔄 固定して再計算';
-    recalcBtn.addEventListener('click', () => runOptimization());
+    recalcBtn.addEventListener('click', () => safeRunOptimization());
     list.appendChild(recalcBtn);
   }
 
@@ -4190,7 +4346,7 @@ function updatePinnedUI() {
 function clearAllPins() {
   pinnedAssists = {};
   updatePinnedUI();
-  runOptimization();
+  safeRunOptimization();
 }
 
 function isFullyMet(state) {
