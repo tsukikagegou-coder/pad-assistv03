@@ -1,5 +1,5 @@
 /* ====================================================================
-   パズドラ アシスト検討応援ツール v2 - app.js (改修版)
+   パズドラ アシスト検討応援ツール V1.1.3 - app.js
    ==================================================================== */
 
 // ==================== グローバルデータ ====================
@@ -12,10 +12,15 @@ let typeNames = {};
 let awakenMultipliers = {}; // 覚醒ID → 火力倍率（CSVから読み込み）
 let awakenNameToIdMap = {};  // 覚醒名→覚醒ID 逆引きマップ（消滅アシスト付与覚醒パース用）
 let vanishGrantedCache = {}; // モンスターNo → 付与覚醒ID配列キャッシュ
+let reverseTransformMap = {}; // 変身先No → [変身元No, ...] の逆引きマップ
 
 // ==================== UI状態 ====================
 let currentStep = 0;
 const baseMonsters = [null, null, null, null, null, null];
+// 超覚醒/シンクロ覚醒の選択状態
+const baseSuperAwakens = [null, null, null, null, null, null];  // 各スロットの選択された超覚醒ID (null=なし)
+const baseSynchroAwakens = [false, false, false, false, false, false]; // 各スロットのシンクロ覚醒ON/OFF
+const baseFormViewMode = [0, 0, 0, 0, 0, 0]; // 各スロットの表示形態インデックス (0=変身前, 1=変身後1段目, ...)
 
 // STEP1: 各スロットの条件
 const slotConditions = Array.from({ length: 6 }, () => ({
@@ -74,6 +79,41 @@ let searchModePopupActive = false;
 
 // PDC QRコード元データ保持（QRコード出力機能用）
 let pdcQrRawData = null; // QR読み込み時の元文字列全体
+
+// ==================== PDC IDマッピング ====================
+// monster_data.json の覚醒ID と PDC QRコード上のID は大部分が一致するが、一部不一致がある
+// 不一致分のみを定義（一致するIDはそのまま使用）
+const LOCAL_TO_PDC_AWAKEN_MAP = {
+  35: 38,   // バランスキラー
+  36: 35,   // 攻撃キラー
+  37: 36,   // 体力キラー
+  38: 37,   // 回復キラー
+  39: 42,   // 進化用キラー
+  40: 39,   // 能力覚醒用キラー
+  42: 40,   // 売却用キラー
+  98: 97,   // 自動回復＋
+  99: 98,   // 火ドロップ強化＋
+  100: 99,  // 水ドロップ強化＋
+  101: 100, // 木ドロップ強化＋
+  102: 101, // 光ドロップ強化＋
+  103: 102, // 闇ドロップ強化＋
+  104: 103, // 回復ドロップ強化＋
+};
+// PDC ID → monster_data ID の逆引きテーブル
+const PDC_TO_LOCAL_AWAKEN_MAP = {};
+for (const [local, pdc] of Object.entries(LOCAL_TO_PDC_AWAKEN_MAP)) {
+  PDC_TO_LOCAL_AWAKEN_MAP[pdc] = parseInt(local);
+}
+
+/** monster_data ID → PDC QRコード用ID に変換 */
+function localToPdcAwakenId(id) {
+  return LOCAL_TO_PDC_AWAKEN_MAP[id] !== undefined ? LOCAL_TO_PDC_AWAKEN_MAP[id] : id;
+}
+
+/** PDC QRコード用ID → monster_data ID に変換 */
+function pdcToLocalAwakenId(pdcId) {
+  return PDC_TO_LOCAL_AWAKEN_MAP[pdcId] !== undefined ? PDC_TO_LOCAL_AWAKEN_MAP[pdcId] : pdcId;
+}
 
 // ==================== 火力覚醒ペアリング ====================
 // ベース覚醒 → ＋覚醒 のマッピング
@@ -255,6 +295,7 @@ async function loadAllData() {
     assistMonsters = allMonsters.filter(m => m.assist === 1);
 
     await loadCSVMappings();
+    buildReverseTransformMap();
     return true;
   } catch (err) {
     console.error('Data load error:', err);
@@ -553,15 +594,22 @@ function hasResonance(base, assist) {
   return bTypes.some(t => aTypes.includes(t));
 }
 
-// 浮遊の変身チェック: ベースが変身後も含めて浮遊を持っているか
+// 浮遊の変身チェック: ベースが変身後も含めて浮遊を持っているか（超覚醒/シンクロ覚醒も考慮）
 function baseHasLevitation(base) {
   if (!base) return false;
+  const slotIdx = baseMonsters.indexOf(base);
+  if (slotIdx >= 0) {
+    const allAw = getBaseAwakensWithExtra(slotIdx);
+    return allAw.includes(106);
+  }
+  // baseMonsters配列にない場合はfallback
   const aw = getBaseAwakensContribution(base);
   return aw.includes(106);
 }
 
 /**
  * ベースモンスターのアシスト無しの状態での「最終形態」の覚醒を取得（変身対応）
+ * ※超覚醒/シンクロ覚醒は含まない基本覚醒のみ
  */
 function getBaseAwakensContribution(base) {
   if (!base) return [];
@@ -577,6 +625,154 @@ function getBaseAwakensContribution(base) {
     break;
   }
   return current.awakens || [];
+}
+
+/**
+ * 変身逆引きマップを構築（データ読み込み後に1回だけ呼ぶ）
+ * reverseTransformMap[targetNo] = [sourceNo1, sourceNo2, ...]
+ */
+function buildReverseTransformMap() {
+  reverseTransformMap = {};
+  for (const m of allMonsters) {
+    const skill = getSkillInfo(m);
+    if (!skill) continue;
+    const cmn = skill.changeMonsterNo;
+    if (cmn == null) continue;
+    // changeMonsterNoはintまたはlist
+    const targets = Array.isArray(cmn) ? cmn : [cmn];
+    for (const t of targets) {
+      if (!reverseTransformMap[t]) reverseTransformMap[t] = [];
+      reverseTransformMap[t].push(m.no);
+    }
+  }
+}
+
+/**
+ * ベースモンスターの変身チェーンを配列で取得（双方向対応）
+ * 逆引きマップで始点まで遡り、前方に全チェーンを辿る
+ * @param {Object} base - ベースモンスター
+ * @returns {Array} [{no, name, awakens, ...}, ...] 変身チェーンのモンスター配列（1個なら変身なし）
+ */
+function getTransformChain(base) {
+  if (!base) return [];
+
+  // ステップ1: 逆引きで始点（変身チェーンの最初）まで遡る
+  let startNo = base.no;
+  const visitedBack = new Set([startNo]);
+  while (reverseTransformMap[startNo]) {
+    const sources = reverseTransformMap[startNo];
+    // 始点は逆引き元が1つだけ（分岐変身の逆引きで複数ある場合は最初を使う）
+    const srcNo = sources[0];
+    if (visitedBack.has(srcNo)) break; // 循環防止
+    visitedBack.add(srcNo);
+    startNo = srcNo;
+  }
+
+  const startMon = allMonsters.find(m => m.no === startNo);
+  if (!startMon) return [base]; // 見つからなければベース自身のみ
+
+  // ステップ2: 始点から前方にチェーンを辿る
+  const chain = [startMon];
+  const visited = new Set([startMon.no]);
+
+  // BFS的に辿る（分岐変身に対応）
+  let i = 0;
+  while (i < chain.length) {
+    const current = chain[i];
+    const skill = getSkillInfo(current);
+    if (skill && skill.changeMonsterNo != null) {
+      const targets = Array.isArray(skill.changeMonsterNo) ? skill.changeMonsterNo : [skill.changeMonsterNo];
+      for (const tNo of targets) {
+        if (visited.has(tNo)) continue;
+        const next = allMonsters.find(m => m.no === tNo);
+        if (next) {
+          chain.push(next);
+          visited.add(next.no);
+        }
+      }
+    }
+    i++;
+  }
+
+  return chain;
+}
+
+/**
+ * 指定スロットの現在の表示形態のモンスターデータを取得
+ * @param {number} slotIdx
+ * @returns {Object|null} 表示形態のモンスター
+ */
+function getViewFormMonster(slotIdx) {
+  const base = baseMonsters[slotIdx];
+  if (!base) return null;
+  const chain = getTransformChain(base);
+  const idx = Math.min(baseFormViewMode[slotIdx], chain.length - 1);
+  return chain[idx];
+}
+
+/**
+ * 変身形態を切り替える
+ * @param {number} slotIdx
+ * @param {number} formIdx - 形態インデックス
+ */
+function setFormView(slotIdx, formIdx) {
+  const base = baseMonsters[slotIdx];
+  if (!base) return;
+  const chain = getTransformChain(base);
+  baseFormViewMode[slotIdx] = Math.min(formIdx, chain.length - 1);
+  // STEP1とSTEP3の表示を更新
+  if (typeof updateStep1BaseInfo === 'function') updateStep1BaseInfo();
+  if (typeof updateStep3BaseConfirmation === 'function') updateStep3BaseConfirmation();
+}
+
+/**
+ * ベースモンスターの基本覚醒 + 超覚醒 + シンクロ覚醒を統合して取得
+ * → 変身チェーンを追跡した最終形態の覚醒 + 超覚醒/シンクロ覚醒
+ * → optimizeの覚醒条件判定（ダンジョン中の覚醒効果）に使用
+ * @param {number} slotIdx - スロットインデックス (0-5)
+ * @returns {Array} 覚醒IDの配列
+ */
+function getBaseAwakensWithExtra(slotIdx) {
+  const base = baseMonsters[slotIdx];
+  if (!base) return [];
+  const baseAw = [...getBaseAwakensContribution(base)];
+  // 超覚醒を追加
+  if (baseSuperAwakens[slotIdx] != null) {
+    baseAw.push(baseSuperAwakens[slotIdx]);
+  }
+  // シンクロ覚醒を追加
+  if (baseSynchroAwakens[slotIdx] && base.synchroAwaken && typeof base.synchroAwaken === 'object') {
+    const synchroId = base.synchroAwaken.awaken;
+    if (synchroId != null) {
+      baseAw.push(synchroId);
+    }
+  }
+  return baseAw;
+}
+
+/**
+ * ベースモンスターの変身前（本体）覚醒 + 超覚醒 + シンクロ覚醒を取得
+ * → 変身を追跡せず、ベース本体の覚醒を返す
+ * → SB計算（ダンジョン開始前）、STEP3表示、比較表に使用
+ * @param {number} slotIdx - スロットインデックス (0-5)
+ * @returns {Array} 覚醒IDの配列（0と覚醒アシスト(49)を除外）
+ */
+function getBaseFormAwakensWithExtra(slotIdx) {
+  const base = baseMonsters[slotIdx];
+  if (!base) return [];
+  const baseAw = [...getActiveAwakens(base)]; // 変身追跡なし、0/49除外済み
+  // 超覚醒を追加
+  if (baseSuperAwakens[slotIdx] != null) {
+    baseAw.push(baseSuperAwakens[slotIdx]);
+  }
+  // シンクロ覚醒を追加
+  if (baseSynchroAwakens[slotIdx] && base.synchroAwaken && typeof base.synchroAwaken === 'object') {
+    const synchroId = base.synchroAwaken.awaken;
+    if (synchroId != null) {
+      baseAw.push(synchroId);
+    }
+  }
+  return baseAw;
 }
 
 function awakenIcon(id) { return `awakens/icon/${id}.png`; }
@@ -755,6 +951,14 @@ function searchMonsters(query, resultsEl, slotIdx) {
 
 function selectBaseMonster(slotIdx, monster) {
   baseMonsters[slotIdx] = monster;
+  // ベースが変わったら超覚醒/シンクロ覚醒をリセット
+  baseSuperAwakens[slotIdx] = null;
+  baseSynchroAwakens[slotIdx] = false;
+  // 表示形態をチェーン内でのベース位置に設定（最終段階設定時もその段階から表示）
+  const chain = getTransformChain(monster);
+  const posInChain = chain.findIndex(m => m.no === monster.no);
+  baseFormViewMode[slotIdx] = posInChain >= 0 ? posInChain : 0;
+
   const info = document.getElementById(`base-info-${slotIdx}`);
   const results = document.getElementById(`base-results-${slotIdx}`);
   const input = document.getElementById(`base-search-${slotIdx}`);
@@ -765,12 +969,51 @@ function selectBaseMonster(slotIdx, monster) {
   const types = (monster.types || []).filter(t => t > 0);
   const awakens = getActiveAwakens(monster);
 
+  // 超覚醒の有無判定
+  const superAwakens = monster.superAwakens;
+  const hasSuperAwakens = Array.isArray(superAwakens) && superAwakens.length > 0 && superAwakens[0] !== null;
+  // シンクロ覚醒の有無判定
+  const synchroAwaken = monster.synchroAwaken;
+  const hasSynchroAwaken = synchroAwaken && typeof synchroAwaken === 'object' && synchroAwaken.awaken != null;
+
+  let extraHtml = '';
+  // 超覚醒選択行（シンクロ覚醒と同じスタイル）
+  if (hasSuperAwakens) {
+    const selectedSA = baseSuperAwakens[slotIdx];
+    extraHtml += `
+      <div class="synchro-awaken-section" id="super-awaken-section-${slotIdx}" style="margin-top:6px;">
+        <div class="synchro-awaken-row" style="border-color:rgba(245,158,11,0.3); background:rgba(245,158,11,0.06);">
+          ${selectedSA != null ? `<img src="${awakenIcon(selectedSA)}" title="${awakenName(selectedSA)}" style="width:20px;height:20px;vertical-align:middle;margin-right:4px;">` : '<span style="display:inline-block;width:20px;height:20px;margin-right:4px;"></span>'}
+          <span style="font-size:0.82rem; color:var(--text-secondary);">超覚醒: <span id="super-awaken-label-${slotIdx}">${selectedSA != null ? awakenName(selectedSA) : '未選択'}</span></span>
+          <button class="btn-super-awaken-select-mini" onclick="openSuperAwakenPopup(${slotIdx})" style="margin-left:auto;">${selectedSA != null ? '変更' : '選択'}</button>
+        </div>
+      </div>
+    `;
+  }
+  // シンクロ覚醒トグル
+  if (hasSynchroAwaken) {
+    const synchroId = synchroAwaken.awaken;
+    extraHtml += `
+      <div class="synchro-awaken-section" id="synchro-awaken-section-${slotIdx}" style="margin-top:6px;">
+        <div class="synchro-awaken-row">
+          <img src="${awakenIcon(synchroId)}" title="${awakenName(synchroId)}" style="width:20px;height:20px;vertical-align:middle;margin-right:4px;">
+          <span style="font-size:0.82rem; color:var(--text-secondary);">シンクロ覚醒: ${awakenName(synchroId)}</span>
+          <label class="toggle-switch" style="margin-left:auto;">
+            <input type="checkbox" id="synchro-toggle-${slotIdx}" onchange="toggleSynchroAwaken(${slotIdx}, this.checked)">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+      </div>
+    `;
+  }
+
   info.innerHTML = `
     <span class="mon-id">No.${monster.no}</span>
     <span class="mon-name-display">${getMonsterIconHtml(monster.no)} ${monster.name}</span>
     <div class="mon-attrs">${attrs.map(a => `<img src="${attrIcon(a)}" title="${attrName(a)}">`).join('')}</div>
     <div class="mon-types">${types.map(t => `<img src="${typeIcon(t)}" title="${typeName(t)}">`).join('')}</div>
     <div class="mon-awakens">${awakens.map(a => `<img src="${awakenIcon(a)}" title="${awakenName(a)}">`).join('')}</div>
+    ${extraHtml}
     <div class="mon-skill" style="font-size:0.8rem; margin-top:4px; color:var(--text-muted);">
       ${(function () {
       const s = getSkillInfo(monster);
@@ -789,6 +1032,144 @@ function selectBaseMonster(slotIdx, monster) {
   if (pinnedAssists[slotIdx]) {
     updatePreAssistDisplay(slotIdx);
   }
+}
+
+/**
+ * 超覚醒選択ポップアップを表示
+ */
+function openSuperAwakenPopup(slotIdx) {
+  const monster = baseMonsters[slotIdx];
+  if (!monster || !Array.isArray(monster.superAwakens)) return;
+
+  // 既存のポップアップがあれば削除
+  const existing = document.getElementById('super-awaken-popup-overlay');
+  if (existing) existing.remove();
+
+  const overlay = document.createElement('div');
+  overlay.id = 'super-awaken-popup-overlay';
+  overlay.className = 'modal-overlay';
+  overlay.style.display = 'flex';
+
+  const currentSelected = baseSuperAwakens[slotIdx];
+
+  let gridHtml = `
+    <div class="super-awaken-option ${currentSelected == null ? 'selected' : ''}" data-awaken-id="none">
+      <div class="super-awaken-option-inner">
+        <span style="font-size:1.2rem; color:var(--text-muted);">✕</span>
+        <span class="super-awaken-option-name">なし</span>
+      </div>
+    </div>
+  `;
+  for (const awakenId of monster.superAwakens) {
+    if (awakenId == null) continue;
+    const isSelected = currentSelected === awakenId;
+    gridHtml += `
+      <div class="super-awaken-option ${isSelected ? 'selected' : ''}" data-awaken-id="${awakenId}">
+        <div class="super-awaken-option-inner">
+          <img src="${awakenIcon(awakenId)}" title="${awakenName(awakenId)}" style="width:28px;height:28px;">
+          <span class="super-awaken-option-name">${awakenName(awakenId)}</span>
+        </div>
+      </div>
+    `;
+  }
+
+  overlay.innerHTML = `
+    <div class="modal-content" style="max-width:400px; width:90%;">
+      <div class="modal-header">
+        <h2>超覚醒を選択</h2>
+        <span class="modal-close" onclick="closeSuperAwakenPopup()">&times;</span>
+      </div>
+      <div class="modal-body" style="padding:16px;">
+        <div style="font-size:0.85rem; color:var(--text-muted); margin-bottom:12px;">
+          ${getMonsterIconHtml(monster.no)} <strong>${monster.name}</strong> の超覚醒
+        </div>
+        <div class="super-awaken-grid" id="super-awaken-grid">
+          ${gridHtml}
+        </div>
+      </div>
+    </div>
+  `;
+
+  document.body.appendChild(overlay);
+
+  // オーバーレイクリックで閉じる
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) closeSuperAwakenPopup();
+  });
+
+  // 各選択肢のクリックイベント
+  overlay.querySelectorAll('.super-awaken-option').forEach(opt => {
+    opt.addEventListener('click', () => {
+      const id = opt.dataset.awakenId;
+      if (id === 'none') {
+        baseSuperAwakens[slotIdx] = null;
+      } else {
+        const awakenId = parseInt(id);
+        // 同じものをもう一度クリックで解除
+        baseSuperAwakens[slotIdx] = (baseSuperAwakens[slotIdx] === awakenId) ? null : awakenId;
+      }
+      updateSuperAwakenButton(slotIdx);
+      closeSuperAwakenPopup();
+    });
+  });
+}
+
+/**
+ * 超覚醒ポップアップを閉じる
+ */
+function closeSuperAwakenPopup() {
+  const overlay = document.getElementById('super-awaken-popup-overlay');
+  if (overlay) overlay.remove();
+}
+
+/**
+ * 超覚醒ボタンの表示を更新
+ */
+function updateSuperAwakenButton(slotIdx) {
+  const selected = baseSuperAwakens[slotIdx];
+  // STEP0とSTEP1の両方のラベルを更新
+  const labelIds = [`super-awaken-label-${slotIdx}`, `step1-super-awaken-label-${slotIdx}`];
+  
+  for (const labelId of labelIds) {
+    const label = document.getElementById(labelId);
+    if (!label) continue;
+    if (selected != null) {
+      label.textContent = awakenName(selected);
+    } else {
+      label.textContent = '未選択';
+    }
+  }
+  // STEP0の行全体を再描画（アイコンとボタンラベルも更新）
+  const section = document.getElementById(`super-awaken-section-${slotIdx}`);
+  if (section) {
+    const base = baseMonsters[slotIdx];
+    if (base && Array.isArray(base.superAwakens) && base.superAwakens.length > 0) {
+      section.innerHTML = `
+        <div class="synchro-awaken-row" style="border-color:rgba(245,158,11,0.3); background:rgba(245,158,11,0.06);">
+          ${selected != null ? `<img src="${awakenIcon(selected)}" title="${awakenName(selected)}" style="width:20px;height:20px;vertical-align:middle;margin-right:4px;">` : '<span style="display:inline-block;width:20px;height:20px;margin-right:4px;"></span>'}
+          <span style="font-size:0.82rem; color:var(--text-secondary);">超覚醒: <span id="super-awaken-label-${slotIdx}">${selected != null ? awakenName(selected) : '未選択'}</span></span>
+          <button class="btn-super-awaken-select-mini" onclick="openSuperAwakenPopup(${slotIdx})" style="margin-left:auto;">${selected != null ? '変更' : '選択'}</button>
+        </div>
+      `;
+    }
+  }
+  // STEP1のベース情報も更新
+  if (typeof updateStep1BaseInfo === 'function') {
+    updateStep1BaseInfo();
+  }
+}
+
+/**
+ * シンクロ覚醒ON/OFFトグル
+ */
+function toggleSynchroAwaken(slotIdx, isOn) {
+  baseSynchroAwakens[slotIdx] = isOn;
+  // STEP0のトグルも同期
+  const step0Toggle = document.getElementById(`synchro-toggle-${slotIdx}`);
+  if (step0Toggle && step0Toggle.checked !== isOn) step0Toggle.checked = isOn;
+  // STEP1のトグルも同期
+  const step1Toggle = document.getElementById(`step1-synchro-toggle-${slotIdx}`);
+  if (step1Toggle && step1Toggle.checked !== isOn) step1Toggle.checked = isOn;
 }
 
 // ==================== STEP0: アシスト事前入力 ====================
@@ -1235,9 +1616,25 @@ function updateStep1BaseInfo() {
 
     // ベースモンスター情報（上部）
     if (base) {
-      const awakens = getActiveAwakens(base);
-      const attrs = (base.attributes || []).filter((a, idx) => a != null && (a > 0 || (idx === 0 && a === 0)));
-      const types = (base.types || []).filter(t => t > 0);
+      // 変身チェーン取得
+      const chain = getTransformChain(base);
+      const currentFormIdx = Math.min(baseFormViewMode[i], chain.length - 1);
+      const viewMon = chain[currentFormIdx]; // 表示中の形態
+      const awakens = getActiveAwakens(viewMon);
+      const attrs = (viewMon.attributes || []).filter((a, idx) => a != null && (a > 0 || (idx === 0 && a === 0)));
+      const types = (viewMon.types || []).filter(t => t > 0);
+
+      // 変身切替タブHTML
+      let transformTabHtml = '';
+      if (chain.length > 1) {
+        transformTabHtml = `<div class="transform-tabs" style="display:flex; gap:4px; margin-bottom:6px; flex-wrap:wrap;">`;
+        chain.forEach((form, fIdx) => {
+          const isActive = fIdx === currentFormIdx;
+          const tabLabel = fIdx === 0 ? '変身前' : '変身後' + (chain.length > 2 ? fIdx : '');
+          transformTabHtml += `<button class="transform-tab ${isActive ? 'active' : ''}" onclick="setFormView(${i}, ${fIdx})" title="No.${form.no} ${form.name}">${getMonsterIconHtml(form.no)} ${tabLabel}</button>`;
+        });
+        transformTabHtml += `</div>`;
+      }
 
       // 上部にアシスト情報も表示
       let preAssistInfoHtml = '';
@@ -1267,10 +1664,11 @@ function updateStep1BaseInfo() {
 
       panel.innerHTML = `
         <div class="summary-title">📋 ベースモンスター</div>
+        ${transformTabHtml}
         <div class="base-summary-row" style="display:flex; align-items:center; gap:8px;">
-          <span class="bs-label">No.${base.no}</span>
-          ${getMonsterIconHtml(base.no)}
-          <span class="bs-name">${base.name}</span>
+          <span class="bs-label">No.${viewMon.no}</span>
+          ${getMonsterIconHtml(viewMon.no)}
+          <span class="bs-name">${viewMon.name}</span>
           <span style="font-size:0.75rem; color:var(--text-muted); margin-left:8px;">
             ${(function () {
           const s = getSkillInfo(base);
@@ -1282,8 +1680,26 @@ function updateStep1BaseInfo() {
         </div>
         <div class="base-summary-row">
           <span class="bs-label">覚醒</span>
-          <div class="bs-awakens">${awakens.map(a => `<img src="${awakenIcon(a)}" title="${awakenName(a)}">`).join('')}</div>
+          <div class="bs-awakens">${awakens.map(a => `<img src="${awakenIcon(a)}" title="${awakenName(a)}">`).join('')}
+            ${baseSuperAwakens[i] != null ? `<span style="margin:0 2px;color:var(--accent-gold);font-size:0.7rem;">+</span><img src="${awakenIcon(baseSuperAwakens[i])}" title="超覚醒: ${awakenName(baseSuperAwakens[i])}" style="width:18px;height:18px;border:1px solid var(--accent-gold);border-radius:3px;">` : ''}
+            ${baseSynchroAwakens[i] && base.synchroAwaken && base.synchroAwaken.awaken != null ? `<span style="margin:0 2px;color:var(--accent-blue);font-size:0.7rem;">+</span><img src="${awakenIcon(base.synchroAwaken.awaken)}" title="シンクロ覚醒: ${awakenName(base.synchroAwaken.awaken)}" style="width:18px;height:18px;border:1px solid var(--accent-blue);border-radius:3px;">` : ''}
+          </div>
         </div>
+        ${(function() {
+          const superAwakens = base.superAwakens;
+          const hasSA = Array.isArray(superAwakens) && superAwakens.length > 0 && superAwakens[0] !== null;
+          const hasSynchro = base.synchroAwaken && typeof base.synchroAwaken === 'object' && base.synchroAwaken.awaken != null;
+          let extraHtml = '';
+          if (hasSA) {
+            const selected = baseSuperAwakens[i];
+            extraHtml += `<div class="synchro-awaken-section" style="margin-top:4px;"><div class="synchro-awaken-row" style="border-color:rgba(245,158,11,0.3); background:rgba(245,158,11,0.06);">${selected != null ? `<img src="${awakenIcon(selected)}" title="${awakenName(selected)}" style="width:20px;height:20px;vertical-align:middle;margin-right:4px;">` : '<span style="display:inline-block;width:20px;height:20px;margin-right:4px;"></span>'}<span style="font-size:0.82rem; color:var(--text-secondary);">超覚醒: <span id="step1-super-awaken-label-${i}">${selected != null ? awakenName(selected) : '未選択'}</span></span><button class="btn-super-awaken-select-mini" onclick="openSuperAwakenPopup(${i})" style="margin-left:auto;">${selected != null ? '変更' : '選択'}</button></div></div>`;
+          }
+          if (hasSynchro) {
+            const synchroId = base.synchroAwaken.awaken;
+            extraHtml += `<div class="synchro-awaken-section" style="margin-top:4px;"><div class="synchro-awaken-row"><img src="${awakenIcon(synchroId)}" title="${awakenName(synchroId)}" style="width:20px;height:20px;vertical-align:middle;margin-right:4px;"><span style="font-size:0.82rem; color:var(--text-secondary);">シンクロ覚醒: ${awakenName(synchroId)}</span><label class="toggle-switch" style="margin-left:auto;"><input type="checkbox" id="step1-synchro-toggle-${i}" ${baseSynchroAwakens[i] ? 'checked' : ''} onchange="toggleSynchroAwaken(${i}, this.checked); updateStep1BaseInfo();"><span class="toggle-slider"></span></label></div></div>`;
+          }
+          return extraHtml;
+        })()}
         ${preAssistInfoHtml}
       `;
       panel.style.display = 'block';
@@ -1491,13 +1907,35 @@ function updateStep3BaseConfirmation() {
     const base = baseMonsters[i];
     if (!base) continue;
 
-    const attrs = (base.attributes || []).filter((a, idx) => a != null && (a > 0 || (idx === 0 && a === 0)));
-    const types = (base.types || []).filter(t => t > 0);
-    const awakens = getActiveAwakens(base);
-    const skill = getSkillInfo(base);
+    // 変身チェーン取得
+    const chain = getTransformChain(base);
+    const currentFormIdx = Math.min(baseFormViewMode[i], chain.length - 1);
+    const viewMon = chain[currentFormIdx]; // 表示中の形態
 
-    // Add to all awakens for summary
-    allBaseAwakens.push(...awakens);
+    const attrs = (viewMon.attributes || []).filter((a, idx) => a != null && (a > 0 || (idx === 0 && a === 0)));
+    const types = (viewMon.types || []).filter(t => t > 0);
+    const awakens = getActiveAwakens(viewMon);
+    const skill = getSkillInfo(viewMon);
+
+    // サマリー用: 表示中の形態の覚醒 + 超覚醒/シンクロ覚醒
+    const viewAwakens = [...awakens];
+    if (baseSuperAwakens[i] != null) viewAwakens.push(baseSuperAwakens[i]);
+    if (baseSynchroAwakens[i] && base.synchroAwaken && base.synchroAwaken.awaken != null) {
+      viewAwakens.push(base.synchroAwaken.awaken);
+    }
+    allBaseAwakens.push(...viewAwakens);
+
+    // 変身切替タブHTML
+    let transformTabHtml = '';
+    if (chain.length > 1) {
+      transformTabHtml = `<div style="display:flex; gap:2px; margin-bottom:3px; flex-wrap:wrap;">`;
+      chain.forEach((form, fIdx) => {
+        const isActive = fIdx === currentFormIdx;
+        const tabLabel = fIdx === 0 ? '変身前' : '変身後' + (chain.length > 2 ? fIdx : '');
+        transformTabHtml += `<button class="transform-tab-sm ${isActive ? 'active' : ''}" onclick="setFormView(${i}, ${fIdx})" title="No.${form.no} ${form.name}">${tabLabel}</button>`;
+      });
+      transformTabHtml += `</div>`;
+    }
 
     // Create compact card
     const card = document.createElement('div');
@@ -1505,11 +1943,12 @@ function updateStep3BaseConfirmation() {
     card.style.cssText = 'flex: 1 1 30%; min-width: 140px; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 6px; padding: 6px; font-size: 0.75rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); display: flex; flex-direction: column; gap: 3px;';
 
     card.innerHTML = `
+      ${transformTabHtml}
       <div style="font-weight: bold; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border-bottom: 1px solid var(--border-color); padding-bottom: 2px; display: flex; align-items: center; gap: 8px;">
-        ${getMonsterIconHtml(base.no)}
+        ${getMonsterIconHtml(viewMon.no)}
         <div style="display: flex; flex-direction: column;">
-          <span style="color:var(--text-muted); font-size:0.65rem;">No.${base.no}</span>
-          <span style="font-size: 0.72rem;">${base.name}</span>
+          <span style="color:var(--text-muted); font-size:0.65rem;">No.${viewMon.no}</span>
+          <span style="font-size: 0.72rem;">${viewMon.name}</span>
         </div>
       </div>
       <div>
@@ -1518,6 +1957,8 @@ function updateStep3BaseConfirmation() {
       </div>
       <div style="display:flex; flex-wrap:wrap; gap:1px;">
         ${awakens.map(a => `<img src="${awakenIcon(a)}" title="${awakenName(a)}" style="width:16px;height:16px;">`).join('')}
+        ${baseSuperAwakens[i] != null ? `<span style="margin:0 2px;color:var(--accent-gold);font-size:0.7rem;">+</span><img src="${awakenIcon(baseSuperAwakens[i])}" title="超覚醒: ${awakenName(baseSuperAwakens[i])}" style="width:16px;height:16px;border:1px solid var(--accent-gold);border-radius:3px;">` : ''}
+        ${baseSynchroAwakens[i] && base.synchroAwaken && base.synchroAwaken.awaken != null ? `<span style="margin:0 2px;color:var(--accent-blue);font-size:0.7rem;">+</span><img src="${awakenIcon(base.synchroAwaken.awaken)}" title="シンクロ覚醒: ${awakenName(base.synchroAwaken.awaken)}" style="width:16px;height:16px;border:1px solid var(--accent-blue);border-radius:3px;">` : ''}
       </div>
       <div style="color:var(--text-main); line-height:1.3; background: var(--bg-main); padding: 4px; border-radius: 4px; border: 1px solid var(--border-color); margin-top: 2px;">
         ${skill ? `<div style="font-weight:bold; color:var(--accent-gold); margin-bottom:2px; font-size:0.72rem;">${skill.name} (CT:${skill.baseTurn}→${skill.minTurn})</div><div style="display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; text-overflow:ellipsis; font-size:0.7rem; color:var(--text-muted);">${skill.description || 'スキルなし'}</div>` : '<div style="color:var(--text-muted);">スキル情報なし</div>'}
@@ -2157,10 +2598,11 @@ async function optimize() {
   // ★ SB計算はアシストのみで判定するため initialSB = 0
   const initialAwakens = {};
   let initialSB = 0; // アシストのみでSBを集計するので0から開始
-  baseMonsters.forEach(b => {
+  baseMonsters.forEach((b, idx) => {
     if (!b) return;
     // ベースの覚醒はinitialAwakensに含める（覚醒条件判定用）
-    const aw = getBaseAwakensContribution(b);
+    // 超覚醒/シンクロ覚醒も含めて集計
+    const aw = getBaseAwakensWithExtra(idx);
     aw.forEach(id => {
       if (id === 0 || id === 49) return;
       initialAwakens[id] = (initialAwakens[id] || 0) + 1;
@@ -2997,6 +3439,8 @@ function displayResults(results) {
             </div>
             <div class="rbc-awakens">
               ${awakens.map(a => `<img src="${awakenIcon(a)}" title="${awakenName(a)}">`).join('')}
+              ${baseSuperAwakens[i] != null ? `<span style="margin:0 2px;color:var(--accent-gold);font-size:0.65rem;">+</span><img src="${awakenIcon(baseSuperAwakens[i])}" title="超覚醒: ${awakenName(baseSuperAwakens[i])}" style="border:1px solid var(--accent-gold);border-radius:3px;">` : ''}
+              ${baseSynchroAwakens[i] && b.synchroAwaken && b.synchroAwaken.awaken != null ? `<span style="margin:0 2px;color:var(--accent-blue);font-size:0.65rem;">+</span><img src="${awakenIcon(b.synchroAwaken.awaken)}" title="シンクロ覚醒: ${awakenName(b.synchroAwaken.awaken)}" style="border:1px solid var(--accent-blue);border-radius:3px;">` : ''}
             </div>
           </div>`;
       } else {
@@ -3530,12 +3974,12 @@ function renderComparisonTable() {
   html += '<div class="ct-base-awaken-summary" style="background:var(--bg-card); border:1px solid var(--border-color); border-radius:8px; padding:12px; min-width:280px;">';
   html += '<div class="ct-prereq-title" style="margin-bottom:8px; font-size:0.9rem;">⭐ ベース覚醒合計</div>';
 
-  // ベースモンスター全体の覚醒を集計
+  // ベースモンスター全体の覚醒を集計（超覚醒/シンクロ覚醒含む、変身前）
   const baseCounts = {};
   for (let s = 0; s < 6; s++) {
     const b = baseMonsters[s];
     if (!b) continue;
-    const aw = getActiveAwakens(b);
+    const aw = getBaseFormAwakensWithExtra(s);
     aw.forEach(a => { baseCounts[a] = (baseCounts[a] || 0) + 1; });
   }
 
@@ -3597,6 +4041,7 @@ function renderComparisonTable() {
     html += `<td class="ct-slot-label">
       <div class="ct-role">${getRoleName(slot)}</div>
       ${baseMon ? `<div class="ct-base-name" title="${baseMon.name}" style="display:flex; align-items:center; gap:4px; justify-content:center;">${getMonsterIconHtml(baseMon.no)} No.${baseMon.no} ${baseMon.name}</div>` : ''}
+      ${baseMon && (baseSuperAwakens[slot] != null || (baseSynchroAwakens[slot] && baseMon.synchroAwaken && baseMon.synchroAwaken.awaken != null)) ? `<div style="display:flex; align-items:center; gap:2px; justify-content:center; margin-top:2px;">${baseSuperAwakens[slot] != null ? `<img src="${awakenIcon(baseSuperAwakens[slot])}" title="超覚醒: ${awakenName(baseSuperAwakens[slot])}" style="width:14px;height:14px;border:1px solid var(--accent-gold);border-radius:2px;">` : ''}${baseSynchroAwakens[slot] && baseMon.synchroAwaken && baseMon.synchroAwaken.awaken != null ? `<img src="${awakenIcon(baseMon.synchroAwaken.awaken)}" title="シンクロ覚醒: ${awakenName(baseMon.synchroAwaken.awaken)}" style="width:14px;height:14px;border:1px solid var(--accent-blue);border-radius:2px;">` : ''}</div>` : ''}
     </td>`;
 
     results.forEach((res) => {
@@ -4363,11 +4808,12 @@ function isFullyMet(state) {
 }
 
 function calcSBBreakdown(state) {
-  // ベースSB（参考値）
+  // ベースSB（参考値）— 超覚醒/シンクロ覚醒分も含む（変身前の覚醒を使用）
   let baseAwakenSB = 0, baseSbPlus = 0, baseSbMinus = 0;
-  baseMonsters.forEach(b => {
+  baseMonsters.forEach((b, idx) => {
     if (!b) return;
-    for (const a of (b.awakens || [])) {
+    const aw = getBaseFormAwakensWithExtra(idx);
+    for (const a of aw) {
       if (a === 21) baseAwakenSB++;
       if (a === 56) baseSbPlus++;
       if (a === 105) baseSbMinus++;
@@ -5380,6 +5826,34 @@ function processPdcQrData(data) {
         selectBaseMonster(slotIdx, baseMonster);
         successCount++;
 
+        // 超覚醒の読み込み（08プレフィックス）
+        const superAwakenItem = items.find(i => i.startsWith('08') && i.length > 2);
+        if (superAwakenItem) {
+          const pdcSuperAwakenId = parseInt(superAwakenItem.substring(2), 36);
+          if (pdcSuperAwakenId > 0) {
+            const localId = pdcToLocalAwakenId(pdcSuperAwakenId);
+            // モンスターのsuperAwakensに含まれるか確認
+            if (Array.isArray(baseMonster.superAwakens) && baseMonster.superAwakens.includes(localId)) {
+              baseSuperAwakens[slotIdx] = localId;
+              updateSuperAwakenButton(slotIdx);
+            }
+          }
+        }
+
+        // シンクロ覚醒の読み込み（0gプレフィックス）
+        const synchroItem = items.find(i => i.startsWith('0g') && i.length > 2);
+        if (synchroItem) {
+          const pdcSynchroId = parseInt(synchroItem.substring(2), 36);
+          if (pdcSynchroId > 0 && baseMonster.synchroAwaken && typeof baseMonster.synchroAwaken === 'object') {
+            const localId = pdcToLocalAwakenId(pdcSynchroId);
+            if (baseMonster.synchroAwaken.awaken === localId) {
+              baseSynchroAwakens[slotIdx] = true;
+              const synchroToggle = document.getElementById(`synchro-toggle-${slotIdx}`);
+              if (synchroToggle) synchroToggle.checked = true;
+            }
+          }
+        }
+
         if (assistItem) {
           const assistIdStr = assistItem.substring(2);
           const assistId = parseInt(assistIdStr, 36);
@@ -5461,8 +5935,24 @@ function buildQrDataFresh(picks) {
     items.push('04' + b36_99);                 // +HP 99
     items.push('05' + b36_99);                 // +ATK 99
     items.push('06' + b36_99);                 // +RCV 99
-    items.push('07-1');                         // 超覚醒なし
-    items.push('080');                          // 超覚醒IDなし
+
+    // 超覚醒
+    const superAwaken = baseSuperAwakens[slot];
+    if (superAwaken != null) {
+      items.push('07-1');                         // 超覚醒有効フラグ
+      items.push('08' + toBase36(localToPdcAwakenId(superAwaken)));
+    } else {
+      items.push('07-1');                         // 超覚醒なし
+      items.push('080');                          // 超覚醒IDなし
+    }
+
+    // シンクロ覚醒
+    if (baseSynchroAwakens[slot] && baseMon.synchroAwaken && typeof baseMon.synchroAwaken === 'object') {
+      const synchroId = baseMon.synchroAwaken.awaken;
+      if (synchroId != null) {
+        items.push('0g' + toBase36(localToPdcAwakenId(synchroId)));
+      }
+    }
 
     // 同種モンスターの参照ID（01プレフィックス）を追加
     // 同じモンスターが複数スロットに存在する場合
@@ -5526,8 +6016,22 @@ function buildQrDataFromExisting(picks) {
       items.push('04' + b36_99);
       items.push('05' + b36_99);
       items.push('06' + b36_99);
-      items.push('07-1');
-      items.push('080');
+      // 超覚醒
+      const superAwaken = baseSuperAwakens[slot];
+      if (superAwaken != null) {
+        items.push('07-1');
+        items.push('08' + toBase36(localToPdcAwakenId(superAwaken)));
+      } else {
+        items.push('07-1');
+        items.push('080');
+      }
+      // シンクロ覚醒
+      if (baseSynchroAwakens[slot] && baseMon.synchroAwaken && typeof baseMon.synchroAwaken === 'object') {
+        const synchroId = baseMon.synchroAwaken.awaken;
+        if (synchroId != null) {
+          items.push('0g' + toBase36(localToPdcAwakenId(synchroId)));
+        }
+      }
       if (assistMon) {
         items.push('09' + toBase36(assistMon.no));
         items.push('0a' + b36_99);
@@ -5548,11 +6052,29 @@ function buildQrDataFromExisting(picks) {
     const origAssistId = origAssistItem ? parseInt(origAssistItem.substring(2), 36) : null;
 
     // アシスト関連フィールドを除去（09, 0a, 0b, 0c, 0d, 0e）
+    // 超覚醒(07, 08)とシンクロ覚醒(0g)も更新するため除去して再追加する
     const nonAssistItems = items.filter(i => {
       if (i.length < 2) return true;
       const prefix = i.substring(0, 2);
-      return !['09', '0a', '0b', '0c', '0d', '0e'].includes(prefix);
+      return !['09', '0a', '0b', '0c', '0d', '0e', '07', '08', '0g'].includes(prefix);
     });
+
+    // 超覚醒/シンクロ覚醒の再追加
+    const superAwaken2 = baseSuperAwakens[slot];
+    if (superAwaken2 != null) {
+      nonAssistItems.push('07-1');
+      nonAssistItems.push('08' + toBase36(localToPdcAwakenId(superAwaken2)));
+    } else {
+      nonAssistItems.push('07-1');
+      nonAssistItems.push('080');
+    }
+    const baseMon2 = baseMonsters[slot];
+    if (baseSynchroAwakens[slot] && baseMon2 && baseMon2.synchroAwaken && typeof baseMon2.synchroAwaken === 'object') {
+      const synchroId2 = baseMon2.synchroAwaken.awaken;
+      if (synchroId2 != null) {
+        nonAssistItems.push('0g' + toBase36(localToPdcAwakenId(synchroId2)));
+      }
+    }
 
     // 新しいアシスト情報を追加
     if (assistMon) {
