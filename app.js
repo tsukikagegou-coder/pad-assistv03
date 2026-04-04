@@ -1,5 +1,5 @@
 /* ====================================================================
-   パズドラ アシスト検討応援ツール V1.1.3 - app.js
+   パズドラ アシスト検討応援ツール V1.1.4 - app.js
    ==================================================================== */
 
 // ==================== グローバルデータ ====================
@@ -2530,6 +2530,7 @@ async function runOptimization(e) {
     }
   } catch (err) {
     hideProgressUI();
+    resetRecalcBtn();
     isOptimizing = false;
     console.error('Optimization error:', err);
 
@@ -2582,136 +2583,180 @@ function toggleDpsPriority(slotIdx, isChecked) {
 }
 
 async function optimize() {
-  const slotCandidates = [];
+  const MAX_RETRIES = 6;
+  let retryCount = 0;
+  let currentBottleneck = null;
+  const allSolutions = [];   // 全リトライを通じた累積された解（完全一致のみ）
+  const seenUids = new Set(); // 重複排除用
 
-  // 0. 固定スロット数に応じて候補上限を動的に設定
-  const pinnedCount = Object.keys(pinnedAssists).length;
-  const unpinnedCount = 6 - pinnedCount;
-  let candidateLimit;
-  if (unpinnedCount <= 1) candidateLimit = 200;
-  else if (unpinnedCount <= 2) candidateLimit = 150;
-  else if (unpinnedCount <= 3) candidateLimit = 100;
-  else if (unpinnedCount <= 4) candidateLimit = 80;
-  else candidateLimit = 60;
+  while (retryCount <= MAX_RETRIES) {
+    if (stopRequested) break;
 
-  // 1. ベースモンスターによる初期状態の集計
-  // ★ SB計算はアシストのみで判定するため initialSB = 0
-  const initialAwakens = {};
-  let initialSB = 0; // アシストのみでSBを集計するので0から開始
-  baseMonsters.forEach((b, idx) => {
-    if (!b) return;
-    // ベースの覚醒はinitialAwakensに含める（覚醒条件判定用）
-    // 超覚醒/シンクロ覚醒も含めて集計
-    const aw = getBaseAwakensWithExtra(idx);
-    aw.forEach(id => {
-      if (id === 0 || id === 49) return;
-      initialAwakens[id] = (initialAwakens[id] || 0) + 1;
-    });
-  });
+    const slotCandidates = [];
+    const bottleneckTracker = { sb: 0, awakens: {} };
 
-  // 1.5. 固定スロットのSB貢献を事前計算し、残りのSB不足を算出
-  let pinnedSB = 0;
-  const pinnedAwakens = {};
-  for (const [slotIdx, monster] of Object.entries(pinnedAssists)) {
-    pinnedSB += getMonsterSB(monster);
-    const idx = parseInt(slotIdx);
-    if (slotConditions[idx].skillUsable) {
-      pinnedSB += getHasteTurns(monster);
-      if (delayAsSB) pinnedSB += getDelayTurns(monster);
-    }
-    // 固定アシストの覚醒を集計（充足度判定用）
-    // 消滅アシストの場合は付与覚醒を使用
-    getEffectiveAwakensForSearch(monster).forEach(id => {
-      pinnedAwakens[id] = (pinnedAwakens[id] || 0) + 1;
-    });
-  }
-  const remainingSBNeeded = Math.max(0, requiredSB - pinnedSB);
+    // 0. 固定スロット数に応じて候補上限を動的に設定
+    const pinnedCount = Object.keys(pinnedAssists).length;
+    const unpinnedCount = 6 - pinnedCount;
+    let candidateLimit;
+    if (unpinnedCount <= 1) candidateLimit = 200;
+    else if (unpinnedCount <= 2) candidateLimit = 150;
+    else if (unpinnedCount <= 3) candidateLimit = 100;
+    else if (unpinnedCount <= 4) candidateLimit = 80;
+    else candidateLimit = 60;
 
-  // 2. パーティの要求覚醒に基づき、候補全体での「希少性」を算出
-  const awakenScarcity = calculateAwakenScarcity();
-
-  // SB枠サイズ: SB不足が大きいほど多くのSB候補を確保
-  const sbSlotSize = remainingSBNeeded > 10 ? 20 : (remainingSBNeeded > 5 ? 15 : 10);
-
-  for (let i = 0; i < 6; i++) {
-    const raw = filterCandidatesForSlot(i);
-    if (raw.length === 0) {
-      const base = baseMonsters[i];
-      throw new Error(`${getRoleName(i)}${base ? `(${base.name})` : ''}に条件を満たすアシストがありません。条件を緩めてください。`);
+    // リトライ判定: 拡張
+    // フィードバックに基づき、リトライごとに候補数を+100ずつ加算（累進的）
+    if (retryCount > 0) {
+      candidateLimit += retryCount * 100;
     }
 
-    // 検索モードに応じて候補制限を切替
-    // searchModeFast=false（じっくり検索）: 候補制限なしの全数探索
-    // searchModeFast=true（高速検索）: スコアリングで候補を絞り込み
-    if (!searchModeFast && unpinnedCount <= 3) {
-      slotCandidates.push(raw);
-    } else {
-      // 通常モード: スコアリングで候補を絞り込み
-      raw.forEach(m => { m._score = scoreMonsterWithScarcity(m, i, awakenScarcity, pinnedAwakens, remainingSBNeeded); });
-
-      const selectedMap = new Map();
-
-      raw.sort((a, b) => b._score - a._score);
-      raw.slice(0, 20).forEach(m => selectedMap.set(m.no, m));
-
-      const sbSorted = [...raw].sort((a, b) => {
-        const sba = getMonsterSB(a) + (slotConditions[i].skillUsable ? getHasteTurns(a) : 0);
-        const sbb = getMonsterSB(b) + (slotConditions[i].skillUsable ? getHasteTurns(b) : 0);
-        return sbb - sba || b._score - a._score;
+    // 1. ベースモンスターによる初期状態の集計
+    // ★ SB計算はアシストのみで判定するため initialSB = 0
+    const initialAwakens = {};
+    let initialSB = 0; // アシストのみでSBを集計するので0から開始
+    baseMonsters.forEach((b, idx) => {
+      if (!b) return;
+      // ベースの覚醒はinitialAwakensに含める（覚醒条件判定用）
+      // 超覚醒/シンクロ覚醒も含めて集計
+      const aw = getBaseAwakensWithExtra(idx);
+      aw.forEach(id => {
+        if (id === 0 || id === 49) return;
+        initialAwakens[id] = (initialAwakens[id] || 0) + 1;
       });
-      sbSorted.slice(0, sbSlotSize).forEach(m => selectedMap.set(m.no, m));
+    });
 
-      // SB閾値候補: 残りSB不足に貢献できるモンスターを無条件で追加
-      if (remainingSBNeeded > 0 && !pinnedAssists[i]) {
-        const sbThreshold = Math.max(2, Math.ceil(remainingSBNeeded / Math.max(1, unpinnedCount)));
-        raw.filter(m => {
-          const sb = getMonsterSB(m) + (slotConditions[i].skillUsable ? getHasteTurns(m) : 0);
-          return sb >= sbThreshold;
-        }).forEach(m => selectedMap.set(m.no, m));
+    // 1.5. 固定スロットのSB貢献を事前計算し、残りのSB不足を算出
+    let pinnedSB = 0;
+    const pinnedAwakens = {};
+    for (const [slotIdx, monster] of Object.entries(pinnedAssists)) {
+      pinnedSB += getMonsterSB(monster);
+      const idx = parseInt(slotIdx);
+      if (slotConditions[idx].skillUsable) {
+        pinnedSB += getHasteTurns(monster);
+        if (delayAsSB) pinnedSB += getDelayTurns(monster);
+      }
+      // 固定アシストの覚醒を集計（充足度判定用）
+      // 消滅アシストの場合は付与覚醒を使用
+      getEffectiveAwakensForSearch(monster).forEach(id => {
+        pinnedAwakens[id] = (pinnedAwakens[id] || 0) + 1;
+      });
+    }
+    const remainingSBNeeded = Math.max(0, requiredSB - pinnedSB);
+
+    // 2. パーティの要求覚醒に基づき、候補全体での「希少性」を算出
+    const awakenScarcity = calculateAwakenScarcity();
+
+    // SB枠サイズ: SB不足が大きいほど多くのSB候補を確保
+    const sbSlotSize = remainingSBNeeded > 10 ? 20 : (remainingSBNeeded > 5 ? 15 : 10);
+
+    for (let i = 0; i < 6; i++) {
+      const raw = filterCandidatesForSlot(i);
+      if (raw.length === 0) {
+        const base = baseMonsters[i];
+        throw new Error(`${getRoleName(i)}${base ? `(${base.name})` : ''}に条件を満たすアシストがありません。条件を緩めてください。`);
       }
 
-      const hpSorted = [...raw].sort((a, b) => {
-        const hpa = getEffectiveAwakensForSearch(a).filter(aw => aw === 46).length;
-        const hpb = getEffectiveAwakensForSearch(b).filter(aw => aw === 46).length;
-        return hpb - hpa || b._score - a._score;
-      });
-      hpSorted.slice(0, 5).forEach(m => selectedMap.set(m.no, m));
+      // 検索モードに応じて候補制限を切替
+      // searchModeFast=false（じっくり検索）: 候補制限なしの全数探索
+      // searchModeFast=true（高速検索）: スコアリングで候補を絞り込み
+      if (!searchModeFast && unpinnedCount <= 3) {
+        slotCandidates.push(raw);
+      } else {
+        // 通常モード: スコアリングで候補を絞り込み
+        raw.forEach(m => { m._score = scoreMonsterWithScarcity(m, i, awakenScarcity, pinnedAwakens, remainingSBNeeded, currentBottleneck); });
 
-      // 未充足の要求覚醒のみ専門家枠を確保
-      for (const id of Object.keys(partyRequiredAwakens)) {
-        const aid = parseInt(id);
-        const fulfilled = pinnedAwakens[aid] || 0;
-        const target = partyRequiredAwakens[aid];
-        if (fulfilled >= target) continue; // 既に固定アシストで充足済み → スキップ
-        const specialists = raw
-          .filter(m => getVirtualCount(aid, getEffectiveAwakensForSearch(m)) > 0)
-          .sort((a, b) => {
-            const ca = getVirtualCount(aid, getEffectiveAwakensForSearch(a));
-            const cb = getVirtualCount(aid, getEffectiveAwakensForSearch(b));
-            return cb - ca || b._score - a._score;
-          })
-          .slice(0, 2);
-        specialists.forEach(m => selectedMap.set(m.no, m));
+        const selectedMap = new Map();
+
+        raw.sort((a, b) => b._score - a._score);
+        raw.slice(0, 20).forEach(m => selectedMap.set(m.no, m));
+
+        const sbSorted = [...raw].sort((a, b) => {
+          const sba = getMonsterSB(a) + (slotConditions[i].skillUsable ? getHasteTurns(a) : 0);
+          const sbb = getMonsterSB(b) + (slotConditions[i].skillUsable ? getHasteTurns(b) : 0);
+          return sbb - sba || b._score - a._score;
+        });
+        sbSorted.slice(0, sbSlotSize).forEach(m => selectedMap.set(m.no, m));
+
+        // SB閾値候補: 残りSB不足に貢献できるモンスターを無条件で追加
+        if (remainingSBNeeded > 0 && !pinnedAssists[i]) {
+          const sbThreshold = Math.max(2, Math.ceil(remainingSBNeeded / Math.max(1, unpinnedCount)));
+          raw.filter(m => {
+            const sb = getMonsterSB(m) + (slotConditions[i].skillUsable ? getHasteTurns(m) : 0);
+            return sb >= sbThreshold;
+          }).forEach(m => selectedMap.set(m.no, m));
+        }
+
+        const hpSorted = [...raw].sort((a, b) => {
+          const hpa = getEffectiveAwakensForSearch(a).filter(aw => aw === 46).length;
+          const hpb = getEffectiveAwakensForSearch(b).filter(aw => aw === 46).length;
+          return hpb - hpa || b._score - a._score;
+        });
+        hpSorted.slice(0, 5).forEach(m => selectedMap.set(m.no, m));
+
+        // 未充足の要求覚醒のみ専門家枠を確保
+        for (const id of Object.keys(partyRequiredAwakens)) {
+          const aid = parseInt(id);
+          const fulfilled = pinnedAwakens[aid] || 0;
+          const target = partyRequiredAwakens[aid];
+          if (fulfilled >= target) continue; // 既に固定アシストで充足済み → スキップ
+          const specialists = raw
+            .filter(m => getVirtualCount(aid, getEffectiveAwakensForSearch(m)) > 0)
+            .sort((a, b) => {
+              const ca = getVirtualCount(aid, getEffectiveAwakensForSearch(a));
+              const cb = getVirtualCount(aid, getEffectiveAwakensForSearch(b));
+              return cb - ca || b._score - a._score;
+            })
+            .slice(0, 2);
+          specialists.forEach(m => selectedMap.set(m.no, m));
+        }
+
+        let finalRaw = Array.from(selectedMap.values());
+        finalRaw.sort((a, b) => b._score - a._score);
+        slotCandidates.push(finalRaw.slice(0, candidateLimit));
       }
-
-      let finalRaw = Array.from(selectedMap.values());
-      finalRaw.sort((a, b) => b._score - a._score);
-      slotCandidates.push(finalRaw.slice(0, candidateLimit));
     }
+
+    const searchOrder = [0, 1, 2, 3, 4, 5].sort((a, b) => slotCandidates[a].length - slotCandidates[b].length);
+
+    // 全組み合わせ数を算出（進捗計算用）
+    let totalCombinations = 1;
+    for (let i = 0; i < 6; i++) totalCombinations *= slotCandidates[i].length;
+
+    // runDFS を呼び出し。発見済みの解とUIDリストを渡す
+    await runDFS(slotCandidates, searchOrder, initialAwakens, initialSB, totalCombinations, retryCount, currentBottleneck, bottleneckTracker, allSolutions, seenUids);
+
+    // 完全一致候補が累積で30件以上見つかった場合、あるいはユーザーが停止した場合は終了
+    if (allSolutions.length >= 30 || stopRequested) {
+      return allSolutions;
+    }
+
+    // 0件だった場合、または30件に満たない場合、ボトルネックを解析して次のリトライへ
+    let maxFailCount = bottleneckTracker.sb;
+    let nextBottleneck = 'sb';
+    for (const [aid, count] of Object.entries(bottleneckTracker.awakens)) {
+      if (count > maxFailCount) {
+        maxFailCount = count;
+        nextBottleneck = aid;
+      }
+    }
+
+    currentBottleneck = maxFailCount > 0 ? nextBottleneck : 'sb';
+    retryCount++;
+  } // end while loop
+
+  // リトライを使い切っても1件も見つからなかった場合
+  if (allSolutions.length === 0) {
+    throw new Error('条件を満たす組み合わせが見つかりませんでした。検索範囲を最大まで拡張しましたが解がありません。条件を緩和してください。');
   }
 
-  const searchOrder = [0, 1, 2, 3, 4, 5].sort((a, b) => slotCandidates[a].length - slotCandidates[b].length);
+  return allSolutions;
+}
 
-  // 全組み合わせ数を算出（進捗計算用）
-  let totalCombinations = 1;
-  for (let i = 0; i < 6; i++) totalCombinations *= slotCandidates[i].length;
-
-  const results = await runDFS(slotCandidates, searchOrder, initialAwakens, initialSB, totalCombinations);
-
-  if (results.length === 0)
-    throw new Error('条件を満たす組み合わせが見つかりませんでした。条件を緩和するか、必須とする覚醒を見直してください。');
-
-  return results;
+function getBottleneckName(b) {
+  if (b === 'sb') return 'スキルブースト';
+  const name = awakenNames[b];
+  return name ? name : '特定覚醒';
 }
 
 /**
@@ -2746,9 +2791,22 @@ const CAPPED_AWAKEN_IDS = new Set([
  * @param {Object} fulfilledAwakens - 固定アシストが既に提供している覚醒カウント
  * @param {number} remainingSBNeeded - 固定スロットのSBを差し引いた残りの必要SB
  */
-function scoreMonsterWithScarcity(monster, slotIdx, scarcityMap, fulfilledAwakens, remainingSBNeeded) {
+function scoreMonsterWithScarcity(monster, slotIdx, scarcityMap, fulfilledAwakens, remainingSBNeeded, bottleneck = null) {
   let score = 0;
   const active = getEffectiveAwakensForSearch(monster);
+
+  // ボトルネック特化ボーナス加点
+  if (bottleneck) {
+    if (bottleneck === 'sb') {
+      const sb = getMonsterSB(monster) + (slotConditions[slotIdx].skillUsable ? getHasteTurns(monster) + (delayAsSB ? getDelayTurns(monster) : 0) : 0);
+      if (sb > 0) score += sb * 5000;
+    } else {
+      const aid = parseInt(bottleneck);
+      if (getVirtualCount(aid, active) > 0) {
+        score += 10000; // 該当の不足覚醒を持つ候補を最優先
+      }
+    }
+  }
   const cond = slotConditions[slotIdx];
   const base = baseMonsters[slotIdx];
 
@@ -2812,12 +2870,15 @@ function scoreMonsterWithScarcity(monster, slotIdx, scarcityMap, fulfilledAwaken
  * @param {number} initialSB - 初期SB（アシストのみなので0）
  * @param {number} totalCombinations - 全組み合わせ数（進捗計算用）
  */
-async function runDFS(slotCandidates, searchOrder, initialAwakens, initialSB, totalCombinations) {
-  let bestSolutions = [];
-  let fullMatchSolutions = []; // 完全一致の解をリアルタイム表示用に別管理
+async function runDFS(slotCandidates, searchOrder, initialAwakens, initialSB, totalCombinations, retryCount = 0, currentBottleneck = null, bottleneckTracker = null, globalBestSolutions = [], globalSeenUids = new Set()) {
   const MAX_RESULTS = 30;
   dfsIterCount = 0;
   const YIELD_INTERVAL = 3000; // N反復ごとにUIに制御を返す
+
+  // 完全一致解はリトライ間で共有するため引数を使用
+  const fullMatchSolutions = globalBestSolutions;
+  // 各リトライ内でのスコア上位解（条件未達成含む、fallback用）
+  const bestSolutions = []; 
 
   // 枝刈り用の残り「探索ステップ」での最大提供可能量
   const maxRemains = Array.from({ length: 7 }, () => ({ awakens: {}, sb: 0 }));
@@ -2851,18 +2912,16 @@ async function runDFS(slotCandidates, searchOrder, initialAwakens, initialSB, to
     if (st) {
       let statusText = `計算中... 完全一致 ${fullMatchSolutions.length}件 発見`;
       if (pendingRecalc) statusText += ' ※条件変更あり：計算完了後に自動で再計算します';
+      if (retryCount > 0) statusText = `検索拡大(${retryCount}回目): 完全一致 ${fullMatchSolutions.length}件 発見`;
       st.textContent = statusText;
     }
     if (!rc) return;
     const card = buildResultCard(solution, fullMatchSolutions.length - 1, true);
     rc.appendChild(card);
-    // リアルタイム表示カードに即座にイベントをバインド（計算中でも操作可能にする）
     bindCardEvents(card, solution, fullMatchSolutions.length - 1);
   }
 
   // 非同期 solve
-  // currentAwakens: ベース+アシスト覚醒（スコアリング用）
-  // currentAssistAwakens: アシストのみの覚醒（充足判定・表示用）
   async function solve(depth, currentPicks, currentAwakens, currentAssistAwakens, currentSB, currentMaxDelay, currentScore) {
     if (stopRequested) return;
 
@@ -2875,7 +2934,10 @@ async function runDFS(slotCandidates, searchOrder, initialAwakens, initialSB, to
         const bar = document.getElementById('progress-bar-inner');
         const st = document.getElementById('progress-status');
         if (bar) bar.style.width = `${progress.toFixed(1)}%`;
-        if (st) st.textContent = `計算中... ${progress.toFixed(1)}% (完全一致 ${fullMatchSolutions.length}件)`;
+        if (st) {
+          if (retryCount > 0) st.textContent = `検索拡大(${retryCount}回目): ${progress.toFixed(1)}% ... 【${getBottleneckName(currentBottleneck)}】優先 (完全一致 ${fullMatchSolutions.length}件)`;
+          else st.textContent = `計算中... ${progress.toFixed(1)}% (完全一致 ${fullMatchSolutions.length}件)`;
+        }
         await new Promise(r => setTimeout(r, 0));
       }
 
@@ -2893,15 +2955,21 @@ async function runDFS(slotCandidates, searchOrder, initialAwakens, initialSB, to
         solution.picks[p.slotIdx] = p.monster;
       });
 
+      // 重複チェック: モンスターNoの組み合わせ（ソート済み）をUIDとする
+      const uid = solution.picks.map(p => p.no).sort((a, b) => a - b).join('-');
+      if (globalSeenUids.has(uid)) return;
+
+      // 暫定ベスト（不完全一致含む）への追加
       bestSolutions.push(solution);
       bestSolutions.sort((a, b) => b.score - a.score);
       if (bestSolutions.length > MAX_RESULTS) bestSolutions.pop();
 
       // 完全一致ならリアルタイム表示
       if (isFullyMetDirect(solution)) {
+        globalSeenUids.add(uid);
         fullMatchSolutions.push(solution);
         addRealtimeResult(solution);
-        // 完全一致30件以上で自動停止
+        // 合計30件以上で自動停止
         if (fullMatchSolutions.length >= 30) {
           stopRequested = true;
           const st2 = document.getElementById('progress-status');
@@ -2912,25 +2980,23 @@ async function runDFS(slotCandidates, searchOrder, initialAwakens, initialSB, to
     }
 
     // 枝刈り
-    if (!canPotentiallyMeetRequirements(depth, currentAwakens, currentSB, maxRemains)) return;
+    if (!canPotentiallyMeetRequirements(depth, currentAwakens, currentSB, maxRemains, bottleneckTracker)) return;
 
     const slotIdx = searchOrder[depth];
-    // 同種採用の制御: 使用回数をカウントして制限チェック
+    // 同種採用の制御
     const usedCounts = {};
     currentPicks.forEach(p => { usedCounts[p.monster.no] = (usedCounts[p.monster.no] || 0) + 1; });
     for (const m of slotCandidates[slotIdx]) {
       if (stopRequested) return;
       const currentCount = usedCounts[m.no] || 0;
       if (!allowDuplicateAssists) {
-        // OFF時：同種は1体まで（従来通り）
         if (currentCount >= 1) continue;
       } else {
-        // ON時：個別制限 > グローバル制限の順で判定
         const limit = monsterDupLimits[m.no] !== undefined ? monsterDupLimits[m.no] : duplicateMaxCount;
         if (currentCount >= limit) continue;
       }
 
-      // 深さ浅い部分で定期的にUIに制御を返す
+      // 浅い部分で定期的にUIへ
       if (depth <= 1) {
         dfsIterCount++;
         if (dfsIterCount % YIELD_INTERVAL === 0) {
@@ -2938,7 +3004,10 @@ async function runDFS(slotCandidates, searchOrder, initialAwakens, initialSB, to
           const bar = document.getElementById('progress-bar-inner');
           const st = document.getElementById('progress-status');
           if (bar) bar.style.width = `${progress.toFixed(1)}%`;
-          if (st) st.textContent = `計算中... ${progress.toFixed(1)}% (完全一致 ${fullMatchSolutions.length}件)`;
+          if (st) {
+            if (retryCount > 0) st.textContent = `検索拡大(${retryCount}回目): ${progress.toFixed(1)}% ... 【${getBottleneckName(currentBottleneck)}】優先 (完全一致 ${fullMatchSolutions.length}件)`;
+            else st.textContent = `計算中... ${progress.toFixed(1)}% (完全一致 ${fullMatchSolutions.length}件)`;
+          }
           await new Promise(r => setTimeout(r, 0));
         }
       }
@@ -3050,7 +3119,7 @@ function checkRequirementsMet(awakens, sb) {
   return true;
 }
 
-function canPotentiallyMeetRequirements(slot, currentAwakens, currentSB, maxRemains) {
+function canPotentiallyMeetRequirements(slot, currentAwakens, currentSB, maxRemains, bottleneckTracker = null) {
   const remain = maxRemains[slot];
   for (const [id, target] of Object.entries(partyRequiredAwakens)) {
     const aid = parseInt(id);
@@ -3058,11 +3127,17 @@ function canPotentiallyMeetRequirements(slot, currentAwakens, currentSB, maxRema
     const currentHave = getVirtualCount(aid, currentAwakens);
     const potentialMax = getVirtualCount(aid, remain.awakens);
 
-    if (currentHave + potentialMax < target) return false;
+    if (currentHave + potentialMax < target) {
+      if (bottleneckTracker) bottleneckTracker.awakens[aid] = (bottleneckTracker.awakens[aid] || 0) + 1;
+      return false;
+    }
   }
 
   // SB枝刈り (DFSにmaxDelayを渡していないので少し甘めに判定)
-  if (currentSB + remain.sb + 5 < requiredSB) return false; // 5は最大遅延の猶予
+  if (currentSB + remain.sb + 5 < requiredSB) {
+    if (bottleneckTracker) bottleneckTracker.sb++;
+    return false; // 5は最大遅延の猶予
+  }
 
   return true;
 }
