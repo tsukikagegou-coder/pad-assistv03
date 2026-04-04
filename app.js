@@ -275,6 +275,21 @@ async function loadAllData() {
     ]);
     if (!monsterRes.ok || !skillRes.ok) throw new Error('API fetch failed');
 
+    // データベースの更新日時を取得して表示
+    const lastModified = monsterRes.headers.get('Last-Modified');
+    const dateElem = document.getElementById('db-update-date');
+    if (dateElem) {
+      if (lastModified) {
+        const d = new Date(lastModified);
+        const yyyy = d.getFullYear();
+        const mm = String(d.getMonth() + 1).padStart(2, '0');
+        const dd = String(d.getDate()).padStart(2, '0');
+        dateElem.textContent = `データベース最終更新: ${yyyy}-${mm}-${dd}`;
+      } else {
+        dateElem.textContent = `データベース最終更新: 日付取得不可`;
+      }
+    }
+
     allMonsters = await monsterRes.json();
     skillMap = await skillRes.json();
 
