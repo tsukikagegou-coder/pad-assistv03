@@ -1,5 +1,5 @@
 /* ====================================================================
-   パズドラ アシスト検討応援ツール V1.1.4 - app.js
+   パズドラ アシスト検討応援ツール V1.1.5 - app.js
    ==================================================================== */
 
 // ==================== グローバルデータ ====================
@@ -83,6 +83,8 @@ let pdcQrRawData = null; // QR読み込み時の元文字列全体
 // ==================== PDC IDマッピング ====================
 // monster_data.json の覚醒ID と PDC QRコード上のID は大部分が一致するが、一部不一致がある
 // 不一致分のみを定義（一致するIDはそのまま使用）
+// ※105以降は monster_data / PDC ともに連番で一致するため定義不要
+//   （V1.1.5 新覚醒 143〜153：加速/15強/希望・勇気・幸運のソウル/アシスト無効耐性/縦消し攻撃 も同一IDで変換）
 const LOCAL_TO_PDC_AWAKEN_MAP = {
   35: 38,   // バランスキラー
   36: 35,   // 攻撃キラー
@@ -163,6 +165,9 @@ const DPS_BASE_IDS = [
   138,                 // アシスト共鳴
   139,                 // 自力
   131, 132,            // 部位破壊, アフタヌーンティ
+  143,                 // 加速
+  144,                 // 超絶コンボ強化（15強）
+  149, 150, 151, 152, 153, // 縦消し攻撃（火/水/木/光/闇）
   // キラー
   31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
 ];
@@ -212,36 +217,153 @@ for (const [downId, val] of Object.entries(UPGRADE_AWAKEN_MAP)) {
   DOWNGRADE_AWAKEN_MAP[val.upId] = { downId: parseInt(downId), ratio: val.ratio };
 }
 
+// ==================== ソウル系覚醒（複合覚醒）マッピング ====================
+// ソウル覚醒ID → { 構成覚醒ID: 個数 }
+// ソウル覚醒1個で、構成覚醒を指定個数ぶん保有しているものとして扱う
+const SOUL_AWAKEN_COMPONENTS = {
+  145: { 56: 1, 127: 1 }, // 希望のソウル = スキルブースト＋×1（スキブ2個分） + 全パラメータ強化×1
+  146: { 28: 2, 127: 1 }, // 勇気のソウル = 封印耐性×2 + 全パラメータ強化×1
+  147: { 53: 2, 127: 1 }, // 幸運のソウル = 操作時間延長＋×2 + 全パラメータ強化×1
+};
+const SOUL_AWAKEN_IDS = new Set(Object.keys(SOUL_AWAKEN_COMPONENTS).map(Number));
+
+/**
+ * 覚醒配列/カウントオブジェクトから、指定覚醒IDの「直接の保有数」を取得
+ */
+function getDirectAwakenCount(awakenId, awakens) {
+  if (!awakens) return 0;
+  if (Array.isArray(awakens)) return awakens.filter(a => a === awakenId).length;
+  return awakens[awakenId] || 0;
+}
+
+/**
+ * ソウル系覚醒による、指定覚醒IDへの加算数を取得
+ * @param {number} awakenId - 構成覚醒ID（例: 28 封印耐性）
+ * @param {Array|Object} awakens - 覚醒配列またはカウントオブジェクト
+ * @returns {number} ソウル由来の加算数
+ */
+function getSoulBonusCount(awakenId, awakens) {
+  let bonus = 0;
+  for (const soulId of SOUL_AWAKEN_IDS) {
+    const per = SOUL_AWAKEN_COMPONENTS[soulId][awakenId];
+    if (!per) continue;
+    bonus += getDirectAwakenCount(soulId, awakens) * per;
+  }
+  return bonus;
+}
+
+/**
+ * 直接保有数 + ソウル系覚醒による加算数
+ */
+function getCountWithSoul(awakenId, awakens) {
+  return getDirectAwakenCount(awakenId, awakens) + getSoulBonusCount(awakenId, awakens);
+}
+
+/**
+ * 1個の覚醒が持つスキブ量（ターン）を返す
+ * スキブ=1, スキブ＋=2, スキブマイナス=-1, ソウル系はその構成覚醒から算出
+ */
+function getAwakenSBTurns(a) {
+  if (a === 21) return 1;
+  if (a === 56) return 2;
+  if (a === 105) return -1;
+  const comps = SOUL_AWAKEN_COMPONENTS[a];
+  if (comps) {
+    return (comps[21] || 0) * 1 + (comps[56] || 0) * 2 - (comps[105] || 0);
+  }
+  return 0;
+}
+
+/**
+ * カウントオブジェクトにソウル系覚醒の構成覚醒を加算した結果を返す（表示用）
+ * ソウル覚醒自体のカウントもそのまま残す
+ * @param {Object} counts - {覚醒ID: 個数}
+ * @returns {{counts: Object, soulAdded: Object}} 加算後カウントと、ソウルによる加算数
+ */
+function expandSoulCounts(counts) {
+  const expanded = { ...counts };
+  const soulAdded = {};
+  for (const soulId of SOUL_AWAKEN_IDS) {
+    const n = counts[soulId] || 0;
+    if (!n) continue;
+    for (const [cid, per] of Object.entries(SOUL_AWAKEN_COMPONENTS[soulId])) {
+      expanded[cid] = (expanded[cid] || 0) + n * per;
+      soulAdded[cid] = (soulAdded[cid] || 0) + n * per;
+    }
+  }
+  return { counts: expanded, soulAdded };
+}
+
+/**
+ * 指定覚醒IDの仮想カウントにソウル系覚醒の加算が含まれているか判定
+ * （上位/下位互換経由の加算も含む）
+ */
+function hasSoulContribution(awakenId, awakens) {
+  if (!awakens) return false;
+  const hasSoul = [...SOUL_AWAKEN_IDS].some(id => getDirectAwakenCount(id, awakens) > 0);
+  if (!hasSoul) return false;
+  // ソウルを除外したカウントと比較
+  let withoutSoul;
+  if (Array.isArray(awakens)) {
+    withoutSoul = awakens.filter(a => !SOUL_AWAKEN_IDS.has(a));
+  } else {
+    withoutSoul = { ...awakens };
+    for (const id of SOUL_AWAKEN_IDS) delete withoutSoul[id];
+  }
+  return getVirtualCount(awakenId, awakens) !== getVirtualCount(awakenId, withoutSoul);
+}
+
+/**
+ * 「（ソウル加算あり）」注記のHTMLを返す
+ * @param {number} [addedCount] - ソウルによる加算数（ツールチップ表示用、省略可）
+ */
+function soulNoteHtml(addedCount) {
+  const title = addedCount ? `ソウル系覚醒による加算 +${addedCount}` : 'ソウル系覚醒による加算を含みます';
+  return `<span class="soul-note" title="${title}">（ソウル加算あり）</span>`;
+}
+
+/**
+ * 要求覚醒 rAid の充足判定に、覚醒 a が関係するか（上位/下位互換・5色ドロ強・ソウル構成を含む）
+ */
+function isAwakenRelatedTo(rAid, a) {
+  if (rAid === a) return true;
+  const upgrade = UPGRADE_AWAKEN_MAP[rAid];
+  const downgrade = DOWNGRADE_AWAKEN_MAP[rAid];
+  if (upgrade && upgrade.upId === a) return true;
+  if (downgrade && downgrade.downId === a) return true;
+  // 5色ドロ強の特殊関係
+  if ([99, 100, 101, 102, 103].includes(rAid) && a === 137) return true;
+  if (rAid === 137 && [99, 100, 101, 102, 103].includes(a)) return true;
+  // ソウル系覚醒: 構成覚醒のいずれかが関係していれば関係あり
+  const comps = SOUL_AWAKEN_COMPONENTS[a];
+  if (comps) {
+    return Object.keys(comps).map(Number).some(cid => isAwakenRelatedTo(rAid, cid));
+  }
+  return false;
+}
+
 /**
  * 指定覚醒IDの「仮想的な保有数」を算出（上位覚醒による代替カウント含む）
+ * ※ソウル系覚醒（希望/勇気/幸運のソウル）の構成覚醒も加算する
  * @param {number} awakenId - 判定対象の覚醒ID
  * @param {Array|Object} awakens - 覚醒配列またはカウントオブジェクト {id: count}
  * @returns {number} 仮想的な保有数
  */
 function getVirtualCount(awakenId, awakens) {
-  let count;
-  // 配列かオブジェクトかで処理分岐
-  if (Array.isArray(awakens)) {
-    count = awakens.filter(a => a === awakenId).length;
-  } else {
-    count = awakens[awakenId] || 0;
-  }
+  // 直接保有数 + ソウル系覚醒による加算
+  let count = getCountWithSoul(awakenId, awakens);
 
-  // 下位覚醒を指定した場合: 上位覚醒の保有数をratio倍で加算
+  // 下位覚醒を指定した場合: 上位覚醒の保有数をratio倍で加算（ソウル由来の上位覚醒も含む）
   const upgrade = UPGRADE_AWAKEN_MAP[awakenId];
   if (upgrade) {
-    const upCount = Array.isArray(awakens)
-      ? awakens.filter(a => a === upgrade.upId).length
-      : (awakens[upgrade.upId] || 0);
+    const upCount = getCountWithSoul(upgrade.upId, awakens);
     count += upCount * upgrade.ratio;
   }
 
-  // 上位覚醒を指定した場合: 下位覚醒の保有数を1/ratio倍で加算
+  // 上位覚醒を指定した場合: 下位覚醒の保有数を1/ratio倍で加算（ソウル由来の下位覚醒も含む）
   const downgrade = DOWNGRADE_AWAKEN_MAP[awakenId];
   if (downgrade) {
-    const downCount = Array.isArray(awakens)
-      ? awakens.filter(a => a === downgrade.downId).length
-      : (awakens[downgrade.downId] || 0);
+    const downCount = getCountWithSoul(downgrade.downId, awakens);
     count += downCount / downgrade.ratio;
   }
 
@@ -558,9 +680,8 @@ function getMonsterSB(monster) {
   if (!hasAwakenAssist(monster)) return 0;
   let sb = 0;
   for (const a of (monster.awakens || [])) {
-    if (a === 21) sb += 1;
-    if (a === 56) sb += 2;
-    if (a === 105) sb -= 1;
+    // スキブ=1, スキブ＋=2, スキブマイナス=-1, 希望のソウル=2（スキブ＋1個分）
+    sb += getAwakenSBTurns(a);
   }
   return sb;
 }
@@ -1240,7 +1361,7 @@ function updatePreAssistDisplay(slotIdx) {
 
   const attrs = (monster.attributes || []).filter((a, idx) => a != null && (a > 0 || (idx === 0 && a === 0)));
   const types = (monster.types || []).filter(t => t > 0);
-  const awakens = getActiveAwakens(monster);
+  const awakens = getAllAwakens(monster);
   const skill = getSkillInfo(monster);
 
   const skipLevitation = baseMonsters[slotIdx] && baseHasLevitation(baseMonsters[slotIdx]);
@@ -1602,7 +1723,7 @@ function updateStep1BaseInfo() {
       if (slotDiv) slotDiv.classList.add('slot-preassist-locked');
       if (overlay) {
         const pAttrs = (pinned.attributes || []).filter((a, idx) => a != null && (a > 0 || (idx === 0 && a === 0)));
-        const pAwakens = getActiveAwakens(pinned);
+        const pAwakens = getAllAwakens(pinned);
         overlay.innerHTML = `
           <div class="preassist-overlay-content">
             <span class="preassist-overlay-icon">📍</span>
@@ -1655,7 +1776,7 @@ function updateStep1BaseInfo() {
       let preAssistInfoHtml = '';
       if (pinned) {
         const pAttrs = (pinned.attributes || []).filter((a, idx) => a != null && (a > 0 || (idx === 0 && a === 0)));
-        const pAwakens = getActiveAwakens(pinned);
+        const pAwakens = getAllAwakens(pinned);
         const pSkill = getSkillInfo(pinned);
         preAssistInfoHtml = `
           <div class="step1-preassist-info">
@@ -1983,10 +2104,12 @@ function updateStep3BaseConfirmation() {
   }
 
   // Render summary
-  const awakenCounts = {};
+  const rawBaseCounts = {};
   allBaseAwakens.forEach(id => {
-    awakenCounts[id] = (awakenCounts[id] || 0) + 1;
+    rawBaseCounts[id] = (rawBaseCounts[id] || 0) + 1;
   });
+  // ソウル系覚醒の構成覚醒を加算（注記表示用に加算数も保持）
+  const { counts: awakenCounts, soulAdded: baseSoulAdded } = expandSoulCounts(rawBaseCounts);
 
   const awakenIds = Object.keys(awakenCounts).map(Number);
 
@@ -2002,7 +2125,7 @@ function updateStep3BaseConfirmation() {
   if (awakenIds.length > 0) {
     const summaryHtml = awakenIds.map(id =>
       `<span style="display:inline-flex; align-items:center; margin-right:6px; margin-bottom:4px; background:var(--bg-main); padding:2px 6px; border-radius:12px; border:1px solid var(--border-color); box-shadow:inset 0 1px 2px rgba(0,0,0,0.2);">
-        <img src="${awakenIcon(id)}" title="${awakenName(id)}" style="width:16px;height:16px; margin-right:4px;"> ×<span style="font-weight:bold; margin-left:2px;">${awakenCounts[id]}</span>
+        <img src="${awakenIcon(id)}" title="${awakenName(id)}" style="width:16px;height:16px; margin-right:4px;"> ×<span style="font-weight:bold; margin-left:2px;">${awakenCounts[id]}</span>${baseSoulAdded[id] ? soulNoteHtml(baseSoulAdded[id]) : ''}
       </span>`
     ).join('');
     summaryContainer.innerHTML = `<div style="font-weight:bold; margin-bottom:6px; color:var(--text-main);"><span class="emoji">📊</span> 【ベース覚醒合計】</div><div style="display:flex; flex-wrap:wrap;">${summaryHtml}</div>`;
@@ -2039,6 +2162,7 @@ function updateStep3PreAssistConfirmation() {
   let totalHaste = 0;
   let maxDelay = 0;
   let totalDelay = 0;
+  let soulSbAdded = false; // ソウル系覚醒によるスキブ加算有無
 
   for (let i = 0; i < 6; i++) {
     const pinned = pinnedAssists[i];
@@ -2047,12 +2171,13 @@ function updateStep3PreAssistConfirmation() {
     const base = baseMonsters[i];
     const attrs = (pinned.attributes || []).filter((a, idx) => a != null && (a > 0 || (idx === 0 && a === 0)));
     const types = (pinned.types || []).filter(t => t > 0);
-    const awakens = getActiveAwakens(pinned);
+    const awakens = getAllAwakens(pinned);
+    const activeAwakens = getActiveAwakens(pinned);
     const skill = getSkillInfo(pinned);
 
     // 覚醒合計用
     if (hasAwakenAssist(pinned)) {
-      allAssistAwakens.push(...awakens);
+      allAssistAwakens.push(...activeAwakens);
     }
 
     // スキブ計算
@@ -2061,6 +2186,13 @@ function updateStep3PreAssistConfirmation() {
         if (a === 21) totalSB++;
         if (a === 56) totalSbPlus++;
         if (a === 105) totalSbMinus++;
+        // ソウル系覚醒（希望のソウル）: スキブ＋として加算
+        const soulComps = SOUL_AWAKEN_COMPONENTS[a];
+        if (soulComps) {
+          totalSB += soulComps[21] || 0;
+          totalSbPlus += soulComps[56] || 0;
+          if (soulComps[21] || soulComps[56]) soulSbAdded = true;
+        }
       }
     }
 
@@ -2104,10 +2236,12 @@ function updateStep3PreAssistConfirmation() {
   }
 
   // 覚醒合計サマリー
-  const awakenCounts = {};
+  const rawAssistCounts = {};
   allAssistAwakens.forEach(id => {
-    awakenCounts[id] = (awakenCounts[id] || 0) + 1;
+    rawAssistCounts[id] = (rawAssistCounts[id] || 0) + 1;
   });
+  // ソウル系覚醒の構成覚醒を加算（注記表示用に加算数も保持）
+  const { counts: awakenCounts, soulAdded: assistSoulAdded } = expandSoulCounts(rawAssistCounts);
 
   const awakenIds = Object.keys(awakenCounts).map(Number);
   awakenIds.sort((a, b) => {
@@ -2121,7 +2255,7 @@ function updateStep3PreAssistConfirmation() {
   if (awakenIds.length > 0) {
     const summaryHtml = awakenIds.map(id =>
       `<span style="display:inline-flex; align-items:center; margin-right:6px; margin-bottom:4px; background:var(--bg-main); padding:2px 6px; border-radius:12px; border:1px solid var(--border-color); box-shadow:inset 0 1px 2px rgba(0,0,0,0.2);">
-        <img src="${awakenIcon(id)}" title="${awakenName(id)}" style="width:16px;height:16px; margin-right:4px;"> ×<span style="font-weight:bold; margin-left:2px;">${awakenCounts[id]}</span>
+        <img src="${awakenIcon(id)}" title="${awakenName(id)}" style="width:16px;height:16px; margin-right:4px;"> ×<span style="font-weight:bold; margin-left:2px;">${awakenCounts[id]}</span>${assistSoulAdded[id] ? soulNoteHtml(assistSoulAdded[id]) : ''}
       </span>`
     ).join('');
     awakenSummary.innerHTML = `<div style="font-weight:bold; margin-bottom:6px; color:var(--text-main);"><span class="emoji">📊</span> 【事前アシスト覚醒合計】</div><div style="display:flex; flex-wrap:wrap;">${summaryHtml}</div>`;
@@ -2140,7 +2274,7 @@ function updateStep3PreAssistConfirmation() {
     <div style="font-weight:bold; margin-bottom:6px; color:var(--text-main);"><span class="emoji">⚡</span> 【事前アシスト 実質スキブ数】</div>
     <div class="sb-breakdown" style="padding:0; border:none; box-shadow:none;">
       <div class="sb-row">スキブ覚醒: <span class="sb-val">${netSB}ターン</span></div>
-      <div class="sb-row">SB+: <span class="sb-val">${totalSbPlus}個 (=${netSbPlusTurns}ターン)</span></div>
+      <div class="sb-row">SB+: <span class="sb-val">${totalSbPlus}個 (=${netSbPlusTurns}ターン)</span>${soulSbAdded ? soulNoteHtml() : ''}</div>
       <div class="sb-row">有効ヘイスト: <span class="sb-val">${totalHaste}ターン</span> <span style="color:var(--text-muted);font-size:0.72rem">(スキル使用可のスロットのみ)</span></div>
       <div class="sb-row">遅延: <span class="sb-val">最大${maxDelay}ターン (合計${totalDelay}ターン) ${delayAsSB ? '(加算あり)' : '(加算なし)'}</span></div>
       <div class="sb-total">実質スキブ合計: ${effectiveSB}ターン</div>
@@ -2712,7 +2846,7 @@ async function optimize() {
         // 未充足の要求覚醒のみ専門家枠を確保
         for (const id of Object.keys(partyRequiredAwakens)) {
           const aid = parseInt(id);
-          const fulfilled = pinnedAwakens[aid] || 0;
+          const fulfilled = getVirtualCount(aid, pinnedAwakens); // 上位互換・ソウル加算込み
           const target = partyRequiredAwakens[aid];
           if (fulfilled >= target) continue; // 既に固定アシストで充足済み → スキップ
           const specialists = raw
@@ -2829,7 +2963,7 @@ function scoreMonsterWithScarcity(monster, slotIdx, scarcityMap, fulfilledAwaken
   for (const [id, target] of Object.entries(partyRequiredAwakens)) {
     const aid = parseInt(id);
     const countInMonster = getVirtualCount(aid, active);
-    const have = fulfilledAwakens[aid] || 0;
+    const have = getVirtualCount(aid, fulfilledAwakens); // 上位互換・ソウル加算込み
     const needed = Math.max(0, target - have);
 
     // 不足している覚醒にのみ高得点
@@ -3051,12 +3185,8 @@ async function runDFS(slotCandidates, searchOrder, initialAwakens, initialSB, to
           tempCounts[a] = currentCount + k + 1;
           const isNeeded = Object.entries(partyRequiredAwakens).some(([rid, target]) => {
             const rAid = parseInt(rid);
-            const upgrade = UPGRADE_AWAKEN_MAP[rAid];
-            const downgrade = DOWNGRADE_AWAKEN_MAP[rAid];
-            if (rAid !== a && (!upgrade || upgrade.upId !== a) && (!downgrade || downgrade.downId !== a)) {
-              // 5色ドロ強の特殊関係もチェック
-              if (!([99, 100, 101, 102, 103].includes(rAid) && a === 137) && !(rAid === 137 && [99, 100, 101, 102, 103].includes(a))) return false;
-            }
+            // 上位/下位互換・5色ドロ強・ソウル構成覚醒の関係をチェック
+            if (!isAwakenRelatedTo(rAid, a)) return false;
             return getVirtualCount(rAid, tempCounts) <= target;
           });
           if (isNeeded) {
@@ -3473,9 +3603,9 @@ function buildResultCard(result, idx, isRealtime) {
   const sb = calcSBBreakdown(result);
   html += `
     <div class="sb-breakdown">
-      <div class="sb-row">ベースSB合計: <span class="sb-val">${sb.baseSBTotal}ターン</span> <span style="color:var(--text-muted);font-size:0.75rem">(参考値)</span></div>
+      <div class="sb-row">ベースSB合計: <span class="sb-val">${sb.baseSBTotal}ターン</span>${sb.baseSoulSbAdded ? soulNoteHtml() : ''} <span style="color:var(--text-muted);font-size:0.75rem">(参考値)</span></div>
       <div class="sb-row">アシスト覚醒SB: <span class="sb-val">${sb.assistAwakenSB}</span></div>
-      <div class="sb-row">アシストSB+: <span class="sb-val">${sb.assistSbPlus}個 (=${sb.assistSbPlus * 2}ターン)</span></div>
+      <div class="sb-row">アシストSB+: <span class="sb-val">${sb.assistSbPlus}個 (=${sb.assistSbPlus * 2}ターン)</span>${sb.soulSbAdded ? soulNoteHtml() : ''}</div>
       <div class="sb-row">ヘイスト: <span class="sb-val">${sb.haste}ターン</span></div>
       <div class="sb-row">遅延: <span class="sb-val">最大${sb.maxDelay}ターン (合計${sb.totalDelay}ターン) ${delayAsSB ? '(加算あり)' : '(加算なし)'}</span></div>
       <div class="sb-total">アシストスキブ合計: ${sb.assistTotal}ターン ${requiredSB > 0 ? (sb.assistTotal >= requiredSB ? '✅' : '❌ 不足') : ''}</div>
@@ -3489,9 +3619,10 @@ function buildResultCard(result, idx, isRealtime) {
       const assistCounts = result.assistAwakenCounts || result.awakenCounts;
       const have = getVirtualCount(parseInt(id), assistCounts);
       const ok = have >= cnt;
+      const soulNote = hasSoulContribution(parseInt(id), assistCounts) ? soulNoteHtml() : '';
       html += `<div class="summary-row">
         <span class="summary-label" style="display:flex;align-items:center;gap:4px">
-          <img src="${awakenIcon(id)}" style="width:18px;height:18px"> ${awakenName(id)}
+          <img src="${awakenIcon(id)}" style="width:18px;height:18px"> ${awakenName(id)}${soulNote}
         </span>
         <span class="summary-value-group">
           <span class="summary-value ${ok ? 'ok' : 'ng'}">${have}/${cnt} ${ok ? '✅' : '❌'}</span>
@@ -4065,13 +4196,15 @@ function renderComparisonTable() {
   html += '<div class="ct-prereq-title" style="margin-bottom:8px; font-size:0.9rem;">⭐ ベース覚醒合計</div>';
 
   // ベースモンスター全体の覚醒を集計（超覚醒/シンクロ覚醒含む、変身前）
-  const baseCounts = {};
+  const rawCtBaseCounts = {};
   for (let s = 0; s < 6; s++) {
     const b = baseMonsters[s];
     if (!b) continue;
     const aw = getBaseFormAwakensWithExtra(s);
-    aw.forEach(a => { baseCounts[a] = (baseCounts[a] || 0) + 1; });
+    aw.forEach(a => { rawCtBaseCounts[a] = (rawCtBaseCounts[a] || 0) + 1; });
   }
+  // ソウル系覚醒の構成覚醒を加算
+  const { counts: baseCounts, soulAdded: ctBaseSoulAdded } = expandSoulCounts(rawCtBaseCounts);
 
   const baseAwakenIds = Object.keys(baseCounts).map(Number);
 
@@ -4089,7 +4222,7 @@ function renderComparisonTable() {
     baseAwakenIds.forEach(id => {
       html += `<div style="display:flex; align-items:center; gap:2px; font-size:0.8rem; color:var(--text-secondary);">
         <img src="${awakenIcon(id)}" title="${awakenName(id)}" style="width:16px; height:16px; border-radius:3px;">
-        <span style="font-weight:600;">×${baseCounts[id]}</span>
+        <span style="font-weight:600;">×${baseCounts[id]}</span>${ctBaseSoulAdded[id] ? soulNoteHtml(ctBaseSoulAdded[id]) : ''}
       </div>`;
     });
     html += '</div>';
@@ -4168,13 +4301,15 @@ function renderComparisonTable() {
   html += '<td class="ct-slot-label ct-summary-label">覚醒合計</td>';
   results.forEach((res) => {
     // 全6体の覚醒をカウント
-    const counts = {};
+    const rawCounts = {};
     for (let s = 0; s < 6; s++) {
       const m = res.picks[s];
       if (!m || !hasAwakenAssist(m)) continue;
       const aw = getAllAwakens(m);
-      aw.forEach(a => { counts[a] = (counts[a] || 0) + 1; });
+      aw.forEach(a => { rawCounts[a] = (rawCounts[a] || 0) + 1; });
     }
+    // ソウル系覚醒の構成覚醒を加算
+    const { counts, soulAdded } = expandSoulCounts(rawCounts);
     // 主な覚醒ID（SB関連+要件覚醒を優先表示）
     const priorityIds = [21, 56, 105]; // SB, SB+, SBマイナス
     const reqIds = reqAwakens.map(([id]) => parseInt(id));
@@ -4186,7 +4321,7 @@ function renderComparisonTable() {
     html += '<div class="ct-aw-summary">';
     displayIds.forEach(id => {
       const isReq = reqIds.includes(id);
-      html += `<span class="ct-aw-count ${isReq ? 'ct-aw-req' : ''}"><img src="${awakenIcon(id)}" title="${awakenName(id)}"><span>×${counts[id]}</span></span>`;
+      html += `<span class="ct-aw-count ${isReq ? 'ct-aw-req' : ''}"><img src="${awakenIcon(id)}" title="${awakenName(id)}"><span>×${counts[id]}</span>${soulAdded[id] ? soulNoteHtml(soulAdded[id]) : ''}</span>`;
     });
     html += '</div></td>';
   });
@@ -4207,7 +4342,7 @@ function renderComparisonTable() {
       // 比較表：遅延をスキブに加算しない場合は括弧書きにする
       const delayText = delayAsSB ? `最大${sb.maxDelay}(計${sb.totalDelay})` : `(最大${sb.maxDelay}/計${sb.totalDelay})`;
       html += `<div class="ct-sb-detail">
-        SB:${sb.assistAwakenSB} / SB+:${sb.assistSbPlus * 2} / ヘイスト:${sb.haste} / 遅延:${delayText}
+        SB:${sb.assistAwakenSB} / SB+:${sb.assistSbPlus * 2}${sb.soulSbAdded ? soulNoteHtml() : ''} / ヘイスト:${sb.haste} / 遅延:${delayText}
       </div>
     </td>`;
   });
@@ -4223,7 +4358,8 @@ function renderComparisonTable() {
       reqAwakens.forEach(([id, cnt]) => {
         const have = getVirtualCount(parseInt(id), assistCounts);
         const ok = have >= cnt;
-        html += `<span class="ct-fulfill-item ${ok ? 'ok' : 'ng'}"><img src="${awakenIcon(id)}">${have}/${cnt} ${ok ? '✅' : '❌'}</span>`;
+        const soulNote = hasSoulContribution(parseInt(id), assistCounts) ? soulNoteHtml() : '';
+        html += `<span class="ct-fulfill-item ${ok ? 'ok' : 'ng'}"><img src="${awakenIcon(id)}">${have}/${cnt} ${ok ? '✅' : '❌'}${soulNote}</span>`;
       });
       html += '</div></td>';
     });
@@ -4900,6 +5036,7 @@ function isFullyMet(state) {
 function calcSBBreakdown(state) {
   // ベースSB（参考値）— 超覚醒/シンクロ覚醒分も含む（変身前の覚醒を使用）
   let baseAwakenSB = 0, baseSbPlus = 0, baseSbMinus = 0;
+  let baseSoulSbAdded = false; // ベースのソウル系覚醒によるスキブ加算有無
   baseMonsters.forEach((b, idx) => {
     if (!b) return;
     const aw = getBaseFormAwakensWithExtra(idx);
@@ -4907,6 +5044,13 @@ function calcSBBreakdown(state) {
       if (a === 21) baseAwakenSB++;
       if (a === 56) baseSbPlus++;
       if (a === 105) baseSbMinus++;
+      // ソウル系覚醒（希望のソウル）: スキブ＋として加算
+      const soulComps = SOUL_AWAKEN_COMPONENTS[a];
+      if (soulComps) {
+        baseAwakenSB += soulComps[21] || 0;
+        baseSbPlus += soulComps[56] || 0;
+        if (soulComps[21] || soulComps[56]) baseSoulSbAdded = true;
+      }
     }
   });
   const netBaseSB = Math.max(0, baseAwakenSB - baseSbMinus);
@@ -4914,6 +5058,7 @@ function calcSBBreakdown(state) {
 
   // アシストSB（判定用）
   let assistAwakenSB = 0, assistSbPlus = 0, assistSbMinus = 0, haste = 0, maxDelay = 0, totalDelay = 0;
+  let soulSbAdded = false; // ソウル系覚醒によるスキブ加算有無
   for (let i = 0; i < state.picks.length; i++) {
     const m = state.picks[i];
     if (hasAwakenAssist(m)) {
@@ -4921,6 +5066,13 @@ function calcSBBreakdown(state) {
         if (a === 21) assistAwakenSB++;
         if (a === 56) assistSbPlus++;
         if (a === 105) assistSbMinus++;
+        // ソウル系覚醒（希望のソウル）: スキブ＋として加算
+        const soulComps = SOUL_AWAKEN_COMPONENTS[a];
+        if (soulComps) {
+          assistAwakenSB += soulComps[21] || 0;
+          assistSbPlus += soulComps[56] || 0;
+          if (soulComps[21] || soulComps[56]) soulSbAdded = true;
+        }
       }
     }
     if (slotConditions[i].skillUsable) {
@@ -4934,7 +5086,7 @@ function calcSBBreakdown(state) {
   let assistTotal = netAssistAwakenSB + assistSbPlus * 2 + haste;
   if (delayAsSB) assistTotal += maxDelay;
 
-  return { baseSBTotal, assistAwakenSB: netAssistAwakenSB, assistSbPlus, haste, maxDelay, totalDelay, assistTotal };
+  return { baseSBTotal, assistAwakenSB: netAssistAwakenSB, assistSbPlus, haste, maxDelay, totalDelay, assistTotal, soulSbAdded, baseSoulSbAdded };
 }
 
 // ==================== 最適化検索（6体確定後の向上策） ====================
@@ -5055,8 +5207,9 @@ function calcOptimizeScore(newPicks, baseline, strategy) {
     }
 
     for (const aid of strat.targetAwakens) {
-      const oldCount = baseline.awakenCounts[aid] || 0;
-      const newCount = newAwakenCounts[aid] || 0;
+      // ソウル系覚醒による加算も含めて比較（例: 幸運のソウル → 操作時間延長＋×2）
+      const oldCount = getCountWithSoul(aid, baseline.awakenCounts);
+      const newCount = getCountWithSoul(aid, newAwakenCounts);
       const diff = newCount - oldCount;
       if (diff > 0) {
         // 優先度の高い覚醒に高いウェイト
@@ -5446,20 +5599,25 @@ function buildAwakenDiffHtml(newPicks, baseline, strategy) {
     getEffectiveAwakensForSearch(m).forEach(a => { newAwakenCounts[a] = (newAwakenCounts[a] || 0) + 1; });
   }
 
+  // ソウル系覚醒の構成覚醒を加算した上で比較
+  const { counts: oldExpanded, soulAdded: oldSoulAdded } = expandSoulCounts(baseline.awakenCounts);
+  const { counts: newExpanded, soulAdded: newSoulAdded } = expandSoulCounts(newAwakenCounts);
+
   // 全覚醒IDを集める（旧・新の両方）
   const allIds = new Set([
-    ...Object.keys(baseline.awakenCounts).map(Number),
-    ...Object.keys(newAwakenCounts).map(Number),
+    ...Object.keys(oldExpanded).map(Number),
+    ...Object.keys(newExpanded).map(Number),
   ]);
 
   // 変化のある覚醒のみ抽出
   let diffItems = [];
   for (const aid of allIds) {
-    const oldCount = baseline.awakenCounts[aid] || 0;
-    const newCount = newAwakenCounts[aid] || 0;
+    const oldCount = oldExpanded[aid] || 0;
+    const newCount = newExpanded[aid] || 0;
     const diff = newCount - oldCount;
     if (diff !== 0) {
-      diffItems.push({ id: aid, diff, oldCount, newCount });
+      const hasSoul = !!(oldSoulAdded[aid] || newSoulAdded[aid]);
+      diffItems.push({ id: aid, diff, oldCount, newCount, hasSoul });
     }
   }
 
@@ -5471,7 +5629,7 @@ function buildAwakenDiffHtml(newPicks, baseline, strategy) {
   const diffHtmlItems = diffItems.map(d => {
     const cls = d.diff > 0 ? 'optimize-diff-added' : 'optimize-diff-removed';
     const sign = d.diff > 0 ? '+' : '';
-    return `<span class="${cls}"><img src="${awakenIcon(d.id)}" title="${awakenName(d.id)}">${d.oldCount}→${d.newCount}(${sign}${d.diff})</span>`;
+    return `<span class="${cls}"><img src="${awakenIcon(d.id)}" title="${awakenName(d.id)}">${d.oldCount}→${d.newCount}(${sign}${d.diff})${d.hasSoul ? soulNoteHtml() : ''}</span>`;
   }).join('');
 
   return `<div class="optimize-diff-section">

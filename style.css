@@ -4472,3 +4472,15 @@ details[open]>summary::before {
   background: rgba(139, 92, 246, 0.15);
   color: var(--accent-purple);
 }
+
+/* ==================== ソウル系覚醒 加算注記 ==================== */
+.soul-note {
+  display: inline-block;
+  margin-left: 3px;
+  font-size: 0.65rem;
+  font-weight: 600;
+  color: #b794f6;
+  white-space: nowrap;
+  vertical-align: middle;
+  cursor: help;
+}
