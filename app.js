@@ -1,5 +1,5 @@
 /* ====================================================================
-   パズドラ アシスト検討応援ツール V1.1.5 - app.js
+   パズドラ アシスト検討応援ツール V1.1.6 - app.js
    ==================================================================== */
 
 // ==================== グローバルデータ ====================
@@ -25,8 +25,8 @@ const baseFormViewMode = [0, 0, 0, 0, 0, 0]; // 各スロットの表示形態�
 // STEP1: 各スロットの条件
 const slotConditions = Array.from({ length: 6 }, () => ({
   requiredAwakens: [],
-  attrCondition: null,
-  typeCondition: null,
+  attrConditions: [],         // 属性条件（複数選択・OR条件。空=条件なし。0=無属性も有効値）
+  typeConditions: [],         // タイプ条件（複数選択・OR条件。空=条件なし）
   skillUsable: true,
   resonance: false,
   dpsPriority: false,
@@ -1467,10 +1467,10 @@ function initCondSlots() {
         <details class="skill-detail-details" style="margin-top:12px">
           <summary class="field-label" style="cursor:pointer; outline:none;">🔍 詳細条件（属性・タイプ・スキル）</summary>
           <div style="margin-top:8px;">
-            <div class="field-label" style="font-size:0.82rem">🎨 属性条件（1つ選択、再クリックで解除）</div>
+            <div class="field-label" style="font-size:0.82rem">🎨 属性条件（複数選択可・いずれかに一致、再クリックで解除）</div>
             <div class="icon-grid cond-attr-grid" data-slot="${i}">${attrIcons}</div>
             
-            <div class="field-label" style="font-size:0.82rem; margin-top:8px">🏷️ タイプ条件（1つ選択、再クリックで解除）</div>
+            <div class="field-label" style="font-size:0.82rem; margin-top:8px">🏷️ タイプ条件（複数選択可・いずれかに一致、再クリックで解除）</div>
             <div class="icon-grid cond-type-grid" data-slot="${i}">${typeIcons}</div>
 
             <div class="field-label" style="font-size:0.82rem; margin-top:12px">📝 スキルキーワード条件（任意・複数語句はスペース区切り）</div>
@@ -1557,26 +1557,22 @@ function initCondSlots() {
     if (bt) switchCondSlot(parseInt(bt.dataset.slot));
   });
 
-  // 属性/タイプ（単一選択）
+  // 属性/タイプ（複数選択・OR条件。再クリックで解除）
   container.addEventListener('click', (e) => {
     const btn = e.target.closest('.icon-btn[data-type="attr"], .icon-btn[data-type="type"]');
     if (!btn) return;
     const type = btn.dataset.type;
     const id = parseInt(btn.dataset.id);
     const slot = parseInt(btn.dataset.slot);
-    if (type === 'attr') {
-      const grid = btn.closest('.cond-attr-grid');
-      const was = btn.classList.contains('selected');
-      grid.querySelectorAll('.icon-btn').forEach(b => b.classList.remove('selected'));
-      if (!was) { btn.classList.add('selected'); slotConditions[slot].attrCondition = id; }
-      else { slotConditions[slot].attrCondition = null; }
-      // attrConditionは0(無属性)も有効な値なので、nullチェックで判定する
-    } else if (type === 'type') {
-      const grid = btn.closest('.cond-type-grid');
-      const was = btn.classList.contains('selected');
-      grid.querySelectorAll('.icon-btn').forEach(b => b.classList.remove('selected'));
-      if (!was) { btn.classList.add('selected'); slotConditions[slot].typeCondition = id; }
-      else { slotConditions[slot].typeCondition = null; }
+    // attrConditionsは0(無属性)も有効な値として扱う
+    const list = type === 'attr' ? slotConditions[slot].attrConditions : slotConditions[slot].typeConditions;
+    const idx = list.indexOf(id);
+    if (idx >= 0) {
+      list.splice(idx, 1);
+      btn.classList.remove('selected');
+    } else {
+      list.push(id);
+      btn.classList.add('selected');
     }
   });
 
@@ -1966,8 +1962,9 @@ function updateStep2Summary() {
     if (base) parts.push(`<strong>${base.name}</strong>`);
     else parts.push('<span style="color:var(--text-muted)">ベース未指定</span>');
 
-    if (cond.attrCondition) parts.push(`<img src="${attrIcon(cond.attrCondition)}" title="${attrName(cond.attrCondition)}">`);
-    if (cond.typeCondition) parts.push(`<img src="${typeIcon(cond.typeCondition)}" title="${typeName(cond.typeCondition)}">`);
+    // 属性/タイプ条件（複数時はOR条件のため「/」区切りで表示）
+    if (cond.attrConditions.length > 0) parts.push(cond.attrConditions.map(id => `<img src="${attrIcon(id)}" title="${attrName(id)}">`).join('/'));
+    if (cond.typeConditions.length > 0) parts.push(cond.typeConditions.map(id => `<img src="${typeIcon(id)}" title="${typeName(id)}">`).join('/'));
     if (cond.requiredAwakens.length > 0) {
       const counts = {};
       cond.requiredAwakens.forEach(id => { counts[id] = (counts[id] || 0) + 1; });
@@ -3302,8 +3299,9 @@ function filterCandidatesForSlot(slotIdx) {
     return [{
       no: `any-${slotIdx}`,
       name: '不問',
-      attributes: cond.attrCondition != null ? [cond.attrCondition] : [],
-      types: cond.typeCondition ? [cond.typeCondition] : [],
+      // OR条件で複数選択時は属性/タイプが確定しないため、1つ選択時のみ反映
+      attributes: cond.attrConditions.length === 1 ? [cond.attrConditions[0]] : [],
+      types: cond.typeConditions.length === 1 ? [cond.typeConditions[0]] : [],
       awakens: [...cond.requiredAwakens],
       skill: null
     }];
@@ -3322,21 +3320,16 @@ function filterCandidatesForSlot(slotIdx) {
       }
     }
 
-    // 属性条件（attrCondition=0は無属性なのでnullチェックで判定）
-    if (cond.attrCondition != null) {
-      if (cond.attrCondition === 0) {
-        // 無属性: 第一属性が0のモンスターのみ
-        if ((m.attributes || [])[0] !== 0) return false;
-      } else {
-        const mAttr = (m.attributes || [])[0];
-        const sAttr = (m.attributes || [])[1];
-        if (mAttr !== cond.attrCondition && sAttr !== cond.attrCondition) return false;
-      }
+    // 属性条件（主属性のみ判定。複数選択時はOR条件：いずれか1つに一致すればOK。0=無属性）
+    if (cond.attrConditions.length > 0) {
+      const mAttr = (m.attributes || [])[0];
+      if (!cond.attrConditions.includes(mAttr)) return false;
     }
 
-    // タイプ条件
-    if (cond.typeCondition) {
-      if (!(m.types || []).filter(t => t > 0).includes(cond.typeCondition)) return false;
+    // タイプ条件（複数選択時はOR条件：いずれか1つを持っていればOK）
+    if (cond.typeConditions.length > 0) {
+      const mTypes = (m.types || []).filter(t => t > 0);
+      if (!cond.typeConditions.some(t => mTypes.includes(t))) return false;
     }
 
     // アシスト共鳴
@@ -4118,7 +4111,7 @@ function renderComparisonTable() {
   // ===== ベースモンスターと個別条件 =====
   const hasBase = baseMonsters.some(b => b !== null);
   const hasSlotConds = slotConditions.some(c =>
-    c.requiredAwakens.length > 0 || c.attrCondition || c.typeCondition ||
+    c.requiredAwakens.length > 0 || c.attrConditions.length > 0 || c.typeConditions.length > 0 ||
     !c.skillUsable || c.resonance || c.dpsPriority ||
     c.skillKeyword || c.minTurn !== null || c.maxTurn !== null
   );
@@ -4128,7 +4121,7 @@ function renderComparisonTable() {
     for (let slot = 0; slot < 6; slot++) {
       const b = baseMonsters[slot];
       const c = slotConditions[slot];
-      const hasC = c.requiredAwakens.length > 0 || c.attrCondition || c.typeCondition ||
+      const hasC = c.requiredAwakens.length > 0 || c.attrConditions.length > 0 || c.typeConditions.length > 0 ||
         !c.skillUsable || c.resonance || c.dpsPriority ||
         c.skillKeyword || c.minTurn !== null || c.maxTurn !== null;
 
@@ -4152,8 +4145,9 @@ function renderComparisonTable() {
         if (c.resonance) html += `<span class="ct-aw-chip" style="background:rgba(59, 130, 246, 0.15); border-color:rgba(59, 130, 246, 0.5); color:#93c5fd;">🔗 アシスト共鳴</span>`;
         if (c.dpsPriority) html += `<span class="ct-aw-chip" style="background:rgba(245, 158, 11, 0.15); border-color:rgba(245, 158, 11, 0.5); color:#fcd34d;">⚔️ 火力枠</span>`;
 
-        if (c.attrCondition) html += `<span class="ct-aw-chip" style="color:var(--text-secondary)">属性:${c.attrCondition}</span>`;
-        if (c.typeCondition) html += `<span class="ct-aw-chip" style="color:var(--text-secondary)">タイプ:${c.typeCondition}</span>`;
+        // 属性/タイプ条件（OR条件のため「/」区切りでアイコン表示）
+        if (c.attrConditions.length > 0) html += `<span class="ct-aw-chip" style="color:var(--text-secondary)">属性:${c.attrConditions.map(id => `<img src="${attrIcon(id)}" title="${attrName(id)}">`).join('/')}</span>`;
+        if (c.typeConditions.length > 0) html += `<span class="ct-aw-chip" style="color:var(--text-secondary)">タイプ:${c.typeConditions.map(id => `<img src="${typeIcon(id)}" title="${typeName(id)}">`).join('/')}</span>`;
 
         c.requiredAwakens.forEach(id => {
           html += `<span class="ct-aw-chip"><img src="${awakenIcon(id)}" title="${awakenName(id)}"></span>`;
