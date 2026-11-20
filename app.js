@@ -43,6 +43,25 @@ let selectedDpsAwakens = new Set();
 let partyRequiredAwakens = {};
 let requiredSB = 0;
 let delayAsSB = false;
+// ヘイスト必要数条件（オプション）
+let hasteCondEnabled = false;
+let requiredHaste = 0;
+
+// ヘイスト条件が有効かどうか
+function isHasteCondActive() {
+  return hasteCondEnabled && requiredHaste > 0;
+}
+
+// ヘイスト条件判定用の実効値（遅延加算ONの場合は最大遅延を加算）
+function getEffectiveHaste(haste, maxDelay) {
+  return (haste || 0) + (delayAsSB ? (maxDelay || 0) : 0);
+}
+
+// ヘイスト条件を満たしているか（条件OFF時は常にtrue）
+function isHasteRequirementMet(haste, maxDelay) {
+  if (!isHasteCondActive()) return true;
+  return getEffectiveHaste(haste, maxDelay) >= requiredHaste;
+}
 
 // 除外リスト
 let excludedMonsterNos = new Set();
@@ -2275,6 +2294,7 @@ function updateStep3PreAssistConfirmation() {
       <div class="sb-row">有効ヘイスト: <span class="sb-val">${totalHaste}ターン</span> <span style="color:var(--text-muted);font-size:0.72rem">(スキル使用可のスロットのみ)</span></div>
       <div class="sb-row">遅延: <span class="sb-val">最大${maxDelay}ターン (合計${totalDelay}ターン) ${delayAsSB ? '(加算あり)' : '(加算なし)'}</span></div>
       <div class="sb-total">実質スキブ合計: ${effectiveSB}ターン</div>
+      ${isHasteCondActive() ? `<div class="sb-row">うちヘイスト判定値: <span class="sb-val">${getEffectiveHaste(totalHaste, maxDelay)}ターン</span> <span style="color:var(--text-muted);font-size:0.72rem">(条件: ${requiredHaste}ターン以上${delayAsSB ? '・遅延加算あり' : ''})</span></div>` : ''}
     </div>
   `;
   sbSummary.style.display = 'block';
@@ -2315,8 +2335,32 @@ function initPartyAwakensGrid() {
     grid.appendChild(btn);
   });
 
-  document.getElementById('required-sb').addEventListener('change', (e) => { requiredSB = parseInt(e.target.value) || 0; });
-  document.getElementById('delay-as-sb').addEventListener('change', (e) => { delayAsSB = e.target.checked; });
+  document.getElementById('required-sb').addEventListener('change', (e) => { requiredSB = parseInt(e.target.value) || 0; updateHasteCondUI(); });
+  document.getElementById('delay-as-sb').addEventListener('change', (e) => { delayAsSB = e.target.checked; updatePreAssistConfirmationSafe(); });
+  // ヘイスト必要数条件
+  document.getElementById('haste-cond-enabled').addEventListener('change', (e) => {
+    hasteCondEnabled = e.target.checked;
+    updateHasteCondUI();
+  });
+  document.getElementById('required-haste').addEventListener('change', (e) => {
+    requiredHaste = Math.max(0, parseInt(e.target.value) || 0);
+    e.target.value = requiredHaste;
+    updateHasteCondUI();
+  });
+}
+
+// ヘイスト条件UIの表示切替・警告表示
+function updateHasteCondUI() {
+  const sec = document.getElementById('haste-cond-section');
+  if (sec) sec.style.display = hasteCondEnabled ? 'block' : 'none';
+  const warn = document.getElementById('haste-cond-warning');
+  if (warn) warn.style.display = (hasteCondEnabled && requiredSB > 0 && requiredHaste > requiredSB) ? 'block' : 'none';
+  updatePreAssistConfirmationSafe();
+}
+
+// 事前アシスト確認の再描画（関数が存在する場合のみ）
+function updatePreAssistConfirmationSafe() {
+  try { updateStep3PreAssistConfirmation(); } catch (e) { /* 無視 */ }
 }
 
 function updatePartyBadge(btn, id) {
@@ -2739,7 +2783,7 @@ async function optimize() {
     if (stopRequested) break;
 
     const slotCandidates = [];
-    const bottleneckTracker = { sb: 0, awakens: {} };
+    const bottleneckTracker = { sb: 0, haste: 0, awakens: {} };
 
     // 0. 固定スロット数に応じて候補上限を動的に設定
     const pinnedCount = Object.keys(pinnedAssists).length;
@@ -2774,6 +2818,8 @@ async function optimize() {
 
     // 1.5. 固定スロットのSB貢献を事前計算し、残りのSB不足を算出
     let pinnedSB = 0;
+    let pinnedHaste = 0;
+    let pinnedMaxDelay = 0;
     const pinnedAwakens = {};
     for (const [slotIdx, monster] of Object.entries(pinnedAssists)) {
       pinnedSB += getMonsterSB(monster);
@@ -2781,6 +2827,9 @@ async function optimize() {
       if (slotConditions[idx].skillUsable) {
         pinnedSB += getHasteTurns(monster);
         if (delayAsSB) pinnedSB += getDelayTurns(monster);
+        // ヘイスト条件用
+        pinnedHaste += getHasteTurns(monster);
+        pinnedMaxDelay = Math.max(pinnedMaxDelay, getDelayTurns(monster));
       }
       // 固定アシストの覚醒を集計（充足度判定用）
       // 消滅アシストの場合は付与覚醒を使用
@@ -2789,6 +2838,8 @@ async function optimize() {
       });
     }
     const remainingSBNeeded = Math.max(0, requiredSB - pinnedSB);
+    // ヘイスト条件の残り必要数（条件OFF時は0）
+    const remainingHasteNeeded = isHasteCondActive() ? Math.max(0, requiredHaste - getEffectiveHaste(pinnedHaste, pinnedMaxDelay)) : 0;
 
     // 2. パーティの要求覚醒に基づき、候補全体での「希少性」を算出
     const awakenScarcity = calculateAwakenScarcity();
@@ -2810,7 +2861,7 @@ async function optimize() {
         slotCandidates.push(raw);
       } else {
         // 通常モード: スコアリングで候補を絞り込み
-        raw.forEach(m => { m._score = scoreMonsterWithScarcity(m, i, awakenScarcity, pinnedAwakens, remainingSBNeeded, currentBottleneck); });
+        raw.forEach(m => { m._score = scoreMonsterWithScarcity(m, i, awakenScarcity, pinnedAwakens, remainingSBNeeded, currentBottleneck, remainingHasteNeeded); });
 
         const selectedMap = new Map();
 
@@ -2831,6 +2882,18 @@ async function optimize() {
             const sb = getMonsterSB(m) + (slotConditions[i].skillUsable ? getHasteTurns(m) : 0);
             return sb >= sbThreshold;
           }).forEach(m => selectedMap.set(m.no, m));
+        }
+
+        // ヘイスト条件ON時: ヘイスト（+遅延）持ちの候補を確保
+        if (remainingHasteNeeded > 0 && !pinnedAssists[i] && slotConditions[i].skillUsable) {
+          const hasteOf = (m) => getHasteTurns(m) + (delayAsSB ? getDelayTurns(m) : 0);
+          const hasteSorted = raw.filter(m => hasteOf(m) > 0).sort((a, b) => {
+            return hasteOf(b) - hasteOf(a) || b._score - a._score;
+          });
+          hasteSorted.slice(0, sbSlotSize).forEach(m => selectedMap.set(m.no, m));
+          // 残り必要数に単独で大きく貢献できる候補は無条件で追加
+          const hasteThreshold = Math.max(2, Math.ceil(remainingHasteNeeded / Math.max(1, unpinnedCount)));
+          hasteSorted.filter(m => hasteOf(m) >= hasteThreshold).forEach(m => selectedMap.set(m.no, m));
         }
 
         const hpSorted = [...raw].sort((a, b) => {
@@ -2880,6 +2943,11 @@ async function optimize() {
     // 0件だった場合、または30件に満たない場合、ボトルネックを解析して次のリトライへ
     let maxFailCount = bottleneckTracker.sb;
     let nextBottleneck = 'sb';
+    // ヘイスト条件がボトルネックの場合
+    if ((bottleneckTracker.haste || 0) > maxFailCount) {
+      maxFailCount = bottleneckTracker.haste;
+      nextBottleneck = 'haste';
+    }
     for (const [aid, count] of Object.entries(bottleneckTracker.awakens)) {
       if (count > maxFailCount) {
         maxFailCount = count;
@@ -2901,6 +2969,7 @@ async function optimize() {
 
 function getBottleneckName(b) {
   if (b === 'sb') return 'スキルブースト';
+  if (b === 'haste') return 'ヘイスト';
   const name = awakenNames[b];
   return name ? name : '特定覚醒';
 }
@@ -2937,7 +3006,7 @@ const CAPPED_AWAKEN_IDS = new Set([
  * @param {Object} fulfilledAwakens - 固定アシストが既に提供している覚醒カウント
  * @param {number} remainingSBNeeded - 固定スロットのSBを差し引いた残りの必要SB
  */
-function scoreMonsterWithScarcity(monster, slotIdx, scarcityMap, fulfilledAwakens, remainingSBNeeded, bottleneck = null) {
+function scoreMonsterWithScarcity(monster, slotIdx, scarcityMap, fulfilledAwakens, remainingSBNeeded, bottleneck = null, remainingHasteNeeded = 0) {
   let score = 0;
   const active = getEffectiveAwakensForSearch(monster);
 
@@ -2946,6 +3015,10 @@ function scoreMonsterWithScarcity(monster, slotIdx, scarcityMap, fulfilledAwaken
     if (bottleneck === 'sb') {
       const sb = getMonsterSB(monster) + (slotConditions[slotIdx].skillUsable ? getHasteTurns(monster) + (delayAsSB ? getDelayTurns(monster) : 0) : 0);
       if (sb > 0) score += sb * 5000;
+    } else if (bottleneck === 'haste') {
+      // ヘイスト条件がボトルネック: ヘイスト（+遅延）持ちを最優先
+      const h = slotConditions[slotIdx].skillUsable ? getHasteTurns(monster) + (delayAsSB ? getDelayTurns(monster) : 0) : 0;
+      if (h > 0) score += h * 5000;
     } else {
       const aid = parseInt(bottleneck);
       if (getVirtualCount(aid, active) > 0) {
@@ -3003,6 +3076,11 @@ function scoreMonsterWithScarcity(monster, slotIdx, scarcityMap, fulfilledAwaken
     const delaySB = getDelayTurns(monster);
     score += hasteSB * (sbNeeded > 0 ? 100 : 30);
     score += delaySB * (sbNeeded > 0 ? 80 : 20);
+    // ヘイスト条件の不足分がある場合は追加加点
+    if (remainingHasteNeeded > 0) {
+      const h = hasteSB + (delayAsSB ? delaySB : 0);
+      score += Math.min(h, remainingHasteNeeded) * 800;
+    }
   }
 
   return score;
@@ -3027,16 +3105,19 @@ async function runDFS(slotCandidates, searchOrder, initialAwakens, initialSB, to
   const bestSolutions = []; 
 
   // 枝刈り用の残り「探索ステップ」での最大提供可能量
-  const maxRemains = Array.from({ length: 7 }, () => ({ awakens: {}, sb: 0 }));
+  const maxRemains = Array.from({ length: 7 }, () => ({ awakens: {}, sb: 0, haste: 0 }));
   for (let d = 5; d >= 0; d--) {
     const slotIdx = searchOrder[d];
     const prev = maxRemains[d + 1];
-    const current = { awakens: { ...prev.awakens }, sb: prev.sb };
+    const current = { awakens: { ...prev.awakens }, sb: prev.sb, haste: prev.haste };
     let maxSlotSB = 0;
+    let maxSlotHaste = 0; // ヘイスト条件枝刈り用（遅延加算ONなら遅延も含めた上限）
     const slotAwakensMax = {};
     slotCandidates[slotIdx].forEach(m => {
       const sb = getMonsterSB(m) + (slotConditions[slotIdx].skillUsable ? getHasteTurns(m) + (delayAsSB ? getDelayTurns(m) : 0) : 0);
       if (sb > maxSlotSB) maxSlotSB = sb;
+      const h = slotConditions[slotIdx].skillUsable ? getHasteTurns(m) + (delayAsSB ? getDelayTurns(m) : 0) : 0;
+      if (h > maxSlotHaste) maxSlotHaste = h;
       const act = getEffectiveAwakensForSearch(m);
       const counts = {};
       act.forEach(a => counts[a] = (counts[a] || 0) + 1);
@@ -3045,6 +3126,7 @@ async function runDFS(slotCandidates, searchOrder, initialAwakens, initialSB, to
       }
     });
     current.sb += maxSlotSB;
+    current.haste += maxSlotHaste;
     for (const [aid, c] of Object.entries(slotAwakensMax)) {
       current.awakens[aid] = (current.awakens[aid] || 0) + c;
     }
@@ -3068,7 +3150,7 @@ async function runDFS(slotCandidates, searchOrder, initialAwakens, initialSB, to
   }
 
   // 非同期 solve
-  async function solve(depth, currentPicks, currentAwakens, currentAssistAwakens, currentSB, currentMaxDelay, currentScore) {
+  async function solve(depth, currentPicks, currentAwakens, currentAssistAwakens, currentSB, currentMaxDelay, currentScore, currentHaste = 0) {
     if (stopRequested) return;
 
     if (depth === 6) {
@@ -3088,6 +3170,8 @@ async function runDFS(slotCandidates, searchOrder, initialAwakens, initialSB, to
       }
 
       if (!checkRequirementsMet(currentAssistAwakens, currentSB + (delayAsSB ? currentMaxDelay : 0))) return;
+      // ヘイスト必要数条件（OFF時は常に通過）
+      if (!isHasteRequirementMet(currentHaste, currentMaxDelay)) return;
 
       const solution = {
         picks: Array.from({ length: 6 }),
@@ -3095,7 +3179,8 @@ async function runDFS(slotCandidates, searchOrder, initialAwakens, initialSB, to
         assistAwakenCounts: { ...currentAssistAwakens },
         score: currentScore,
         sbTotal: currentSB,
-        maxDelay: currentMaxDelay
+        maxDelay: currentMaxDelay,
+        hasteTotal: currentHaste
       };
       currentPicks.forEach(p => {
         solution.picks[p.slotIdx] = p.monster;
@@ -3126,7 +3211,7 @@ async function runDFS(slotCandidates, searchOrder, initialAwakens, initialSB, to
     }
 
     // 枝刈り
-    if (!canPotentiallyMeetRequirements(depth, currentAwakens, currentSB, maxRemains, bottleneckTracker)) return;
+    if (!canPotentiallyMeetRequirements(depth, currentAwakens, currentSB, maxRemains, bottleneckTracker, currentHaste, currentMaxDelay)) return;
 
     const slotIdx = searchOrder[depth];
     // 同種採用の制御
@@ -3203,11 +3288,22 @@ async function runDFS(slotCandidates, searchOrder, initialAwakens, initialSB, to
       monsterScore += getMonsterSB(m) * 50;
       let nextSB = currentSB + getMonsterSB(m);
       let nextMaxDelay = currentMaxDelay;
+      let nextHaste = currentHaste;
       if (slotConditions[slotIdx].skillUsable) {
         nextSB += getHasteTurns(m);
+        nextHaste += getHasteTurns(m);
         monsterScore += getHasteTurns(m) * 30;
         monsterScore += getDelayTurns(m) * 20;
         nextMaxDelay = Math.max(currentMaxDelay, getDelayTurns(m));
+      }
+
+      // ヘイスト条件の不足を埋める候補を加点
+      if (isHasteCondActive()) {
+        const effNextHaste = getEffectiveHaste(nextHaste, nextMaxDelay);
+        const effCurHaste = getEffectiveHaste(currentHaste, currentMaxDelay);
+        if (effCurHaste < requiredHaste) {
+          monsterScore += (Math.min(effNextHaste, requiredHaste) - effCurHaste) * 100;
+        }
       }
 
       const effectiveNextSB = nextSB + (delayAsSB ? nextMaxDelay : 0);
@@ -3226,7 +3322,7 @@ async function runDFS(slotCandidates, searchOrder, initialAwakens, initialSB, to
         }
       }
 
-      await solve(depth + 1, [...currentPicks, { slotIdx, monster: m }], nextAwakens, nextAssistAwakens, nextSB, nextMaxDelay, currentScore + monsterScore);
+      await solve(depth + 1, [...currentPicks, { slotIdx, monster: m }], nextAwakens, nextAssistAwakens, nextSB, nextMaxDelay, currentScore + monsterScore, nextHaste);
     }
   }
 
@@ -3261,7 +3357,7 @@ function checkRequirementsMet(awakens, sb) {
   return true;
 }
 
-function canPotentiallyMeetRequirements(slot, currentAwakens, currentSB, maxRemains, bottleneckTracker = null) {
+function canPotentiallyMeetRequirements(slot, currentAwakens, currentSB, maxRemains, bottleneckTracker = null, currentHaste = 0, currentMaxDelay = 0) {
   const remain = maxRemains[slot];
   for (const [id, target] of Object.entries(partyRequiredAwakens)) {
     const aid = parseInt(id);
@@ -3279,6 +3375,14 @@ function canPotentiallyMeetRequirements(slot, currentAwakens, currentSB, maxRema
   if (currentSB + remain.sb + 5 < requiredSB) {
     if (bottleneckTracker) bottleneckTracker.sb++;
     return false; // 5は最大遅延の猶予
+  }
+
+  // ヘイスト条件枝刈り（残りスロットのヘイスト(+遅延)上限を足しても届かない場合）
+  if (isHasteCondActive()) {
+    if (getEffectiveHaste(currentHaste, currentMaxDelay) + (remain.haste || 0) < requiredHaste) {
+      if (bottleneckTracker) bottleneckTracker.haste = (bottleneckTracker.haste || 0) + 1;
+      return false;
+    }
   }
 
   return true;
@@ -3454,6 +3558,7 @@ function isFullyMetDirect(state) {
   }
   const effectiveSB = state.sbTotal + (delayAsSB ? (state.maxDelay || 0) : 0);
   if (requiredSB > 0 && effectiveSB < requiredSB) return false;
+  if (isHasteCondActive() && state.hasteTotal !== undefined && !isHasteRequirementMet(state.hasteTotal, state.maxDelay || 0)) return false;
   return true;
 }
 
@@ -3602,6 +3707,7 @@ function buildResultCard(result, idx, isRealtime) {
       <div class="sb-row">ヘイスト: <span class="sb-val">${sb.haste}ターン</span></div>
       <div class="sb-row">遅延: <span class="sb-val">最大${sb.maxDelay}ターン (合計${sb.totalDelay}ターン) ${delayAsSB ? '(加算あり)' : '(加算なし)'}</span></div>
       <div class="sb-total">アシストスキブ合計: ${sb.assistTotal}ターン ${requiredSB > 0 ? (sb.assistTotal >= requiredSB ? '✅' : '❌ 不足') : ''}</div>
+      ${isHasteCondActive() ? `<div class="sb-total">うちヘイスト${delayAsSB ? '(+遅延)' : ''}: ${sb.hasteEffective}ターン / 必要${requiredHaste}ターン ${sb.hasteOk ? '✅' : '❌ 不足'}</div>` : ''}
     </div>
   `;
 
@@ -4182,6 +4288,14 @@ function renderComparisonTable() {
       <span class="ct-prereq-sb-unit">ターン</span>
     </div></div>`;
   }
+  // ヘイスト必要数条件
+  if (isHasteCondActive()) {
+    html += `<div class="ct-prereq-row" style="margin-top:8px;"><span class="ct-prereq-label">うちヘイスト必要数${delayAsSB ? '(遅延加算あり)' : ''}：</span>`;
+    html += `<div class="ct-prereq-sb-cond">
+      <span class="ct-prereq-sb-num">${requiredHaste}</span>
+      <span class="ct-prereq-sb-unit">ターン</span>
+    </div></div>`;
+  }
 
   html += '</div>'; // ct-prereq 終了
 
@@ -4337,7 +4451,12 @@ function renderComparisonTable() {
       const delayText = delayAsSB ? `最大${sb.maxDelay}(計${sb.totalDelay})` : `(最大${sb.maxDelay}/計${sb.totalDelay})`;
       html += `<div class="ct-sb-detail">
         SB:${sb.assistAwakenSB} / SB+:${sb.assistSbPlus * 2}${sb.soulSbAdded ? soulNoteHtml() : ''} / ヘイスト:${sb.haste} / 遅延:${delayText}
-      </div>
+      </div>`;
+      // ヘイスト必要数条件の判定表示
+      if (isHasteCondActive()) {
+        html += `<div class="ct-sb-detail">うちヘイスト${delayAsSB ? '(+遅延)' : ''}: ${sb.hasteEffective}/${requiredHaste} ${sb.hasteOk ? '✅' : '❌'}</div>`;
+      }
+      html += `
     </td>`;
   });
   html += '</tr>';
@@ -5024,6 +5143,11 @@ function isFullyMet(state) {
     const sb = calcSBBreakdown(state);
     if (sb.assistTotal < requiredSB) return false;
   }
+  // ヘイスト必要数条件
+  if (isHasteCondActive()) {
+    const sb = calcSBBreakdown(state);
+    if (!sb.hasteOk) return false;
+  }
   return true;
 }
 
@@ -5080,7 +5204,11 @@ function calcSBBreakdown(state) {
   let assistTotal = netAssistAwakenSB + assistSbPlus * 2 + haste;
   if (delayAsSB) assistTotal += maxDelay;
 
-  return { baseSBTotal, assistAwakenSB: netAssistAwakenSB, assistSbPlus, haste, maxDelay, totalDelay, assistTotal, soulSbAdded, baseSoulSbAdded };
+  // ヘイスト条件判定値（遅延加算ONなら最大遅延を加算）
+  const hasteEffective = getEffectiveHaste(haste, maxDelay);
+  const hasteOk = isHasteRequirementMet(haste, maxDelay);
+
+  return { baseSBTotal, assistAwakenSB: netAssistAwakenSB, assistSbPlus, haste, maxDelay, totalDelay, assistTotal, soulSbAdded, baseSoulSbAdded, hasteEffective, hasteOk };
 }
 
 // ==================== 最適化検索（6体確定後の向上策） ====================
@@ -5143,6 +5271,8 @@ function getCurrentBaseline() {
 function checkOptimizeConstraints(newPicks, baseline) {
   const newAwakenCounts = {};
   let newTotalSB = 0;
+  let newHaste = 0;
+  let newMaxDelay = 0;
 
   for (let i = 0; i < 6; i++) {
     const m = newPicks[i];
@@ -5153,6 +5283,8 @@ function checkOptimizeConstraints(newPicks, baseline) {
     if (slotConditions[i].skillUsable) {
       newTotalSB += getHasteTurns(m);
       if (delayAsSB) newTotalSB += getDelayTurns(m);
+      newHaste += getHasteTurns(m);
+      newMaxDelay = Math.max(newMaxDelay, getDelayTurns(m));
     }
   }
 
@@ -5165,6 +5297,9 @@ function checkOptimizeConstraints(newPicks, baseline) {
 
   // SB要件チェック
   if (requiredSB > 0 && newTotalSB < requiredSB) return false;
+
+  // ヘイスト必要数条件チェック
+  if (!isHasteRequirementMet(newHaste, newMaxDelay)) return false;
 
   // 火力倍率: 各キャラごとに維持
   for (let i = 0; i < 6; i++) {

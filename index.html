@@ -224,6 +224,22 @@
             <span class="toggle-slider"></span>
           </label>
         </div>
+        <div class="toggle-row">
+          <span class="toggle-label">必要スキブ数のうちヘイスト必要数も条件に設定する</span>
+          <label class="toggle-switch">
+            <input type="checkbox" id="haste-cond-enabled">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+        <div id="haste-cond-section" style="display:none; margin-top:10px;">
+          <div class="num-input-group">
+            <label>うちヘイスト必要数：</label>
+            <input type="number" class="num-input" id="required-haste" min="0" value="0">
+            <span style="font-size:0.82rem;color:var(--text-muted)">ターン</span>
+          </div>
+          <p class="hint-text">※ スキル使用可のスロットのヘイスト合計で判定します。「遅延をスキブに加算する」がONの場合は最大遅延ターンも加算します。</p>
+          <p class="hint-text" id="haste-cond-warning" style="display:none; color:var(--accent-red);">※ ヘイスト必要数が必要スキブ合計を超えています。</p>
+        </div>
       </div>
       <div class="section-card">
         <div class="section-title"><span class="emoji">👥</span> 同じアシストの複数採用設定</div>
